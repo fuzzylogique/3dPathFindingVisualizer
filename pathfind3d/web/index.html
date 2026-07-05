@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#020409">
+<meta name="description" content="Volumetric A* pathfinding visualizer — a 26-connected voxel grid searched in true 3D, rendered as a neon light-trail. Rust→WASM core with a JS fallback.">
+<title>PATHGRID — volumetric A* light-trail</title>
+<style>
+:root{
+  --cy:#4ff2ff; --cy-dim:#227e9b; --am:#ffb054; --hot:#ff6a4d;
+  --bg:#020409; --panel:rgba(5,12,22,.87); --line:rgba(79,242,255,.22);
+  --tx:#c9eef5; --tx-dim:#5d87a0;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--tx); overflow:hidden;
+  font:13px/1.45 Consolas,"SF Mono",ui-monospace,Menlo,monospace;
+  -webkit-font-smoothing:antialiased;
+}
+canvas#scene{position:fixed; inset:0; display:block; touch-action:none; cursor:grab}
+canvas#scene:active{cursor:grabbing}
+#vignette{
+  position:fixed; inset:0; pointer-events:none; z-index:2;
+  background:radial-gradient(130% 130% at 50% 42%, transparent 52%, rgba(0,2,6,.62) 100%);
+}
+#brand{position:fixed; top:14px; left:16px; z-index:4; text-shadow:0 0 14px rgba(79,242,255,.35)}
+#brand h1{margin:0; font-size:15px; font-weight:700; letter-spacing:.38em; color:var(--cy)}
+#brand p{margin:3px 0 0; font-size:10px; letter-spacing:.2em; color:var(--tx-dim); text-transform:uppercase}
+
+#panel{
+  position:fixed; top:14px; right:14px; z-index:4; width:254px;
+  background:var(--panel); border:1px solid var(--line); border-radius:10px;
+  padding:12px; backdrop-filter:blur(8px);
+  box-shadow:0 0 26px rgba(0,229,255,.07), inset 0 0 18px rgba(0,229,255,.04);
+}
+#stStatus{
+  font-size:14px; font-weight:700; letter-spacing:.24em; text-align:center;
+  padding:6px 0 8px; color:var(--tx-dim);
+}
+#stStatus[data-s="run"]{color:var(--cy); text-shadow:0 0 10px rgba(79,242,255,.6)}
+#stStatus[data-s="found"]{color:var(--am); text-shadow:0 0 10px rgba(255,176,84,.6)}
+#stStatus[data-s="nopath"]{color:var(--hot); text-shadow:0 0 10px rgba(255,106,77,.5)}
+.stats{display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px}
+.stats>div{
+  border:1px solid rgba(79,242,255,.12); border-radius:6px; padding:5px 8px;
+  display:flex; justify-content:space-between; align-items:baseline; gap:6px;
+}
+.stats span{font-size:9px; letter-spacing:.14em; color:var(--tx-dim)}
+.stats b{font-size:12px; color:var(--tx); font-weight:700; overflow:hidden; text-overflow:ellipsis}
+.meta{font-size:9px; letter-spacing:.1em; color:var(--tx-dim); text-align:center; margin-bottom:4px}
+.meta b{color:var(--am); font-weight:700}
+.meta i{font-style:normal; color:var(--tx)}
+
+.btns{display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:8px 0 10px}
+button{
+  font:inherit; font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--cy); background:rgba(16,42,58,.5); border:1px solid var(--line);
+  border-radius:6px; padding:8px 4px; cursor:pointer; min-height:34px;
+}
+button:hover{background:rgba(28,80,104,.6); box-shadow:0 0 10px rgba(79,242,255,.25)}
+button:active{transform:translateY(1px)}
+button.primary{color:#03202b; background:var(--cy); border-color:var(--cy); font-weight:700}
+button.primary:hover{box-shadow:0 0 18px rgba(79,242,255,.6)}
+:focus-visible{outline:2px solid var(--cy); outline-offset:2px; border-radius:4px}
+
+.row{
+  display:grid; grid-template-columns:56px 1fr 44px; align-items:center; gap:8px;
+  margin:7px 0; font-size:10px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase;
+}
+.row output{text-align:right; color:var(--tx); font-size:11px}
+input[type=range]{width:100%; accent-color:var(--cy); height:22px; background:transparent; cursor:pointer}
+.tgs{display:grid; gap:6px; margin-top:9px}
+.tg{
+  display:flex; gap:9px; align-items:center; cursor:pointer;
+  font-size:10px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase; min-height:22px;
+}
+.tg input{accent-color:var(--cy); width:15px; height:15px; margin:0; cursor:pointer}
+.keys{margin:10px 0 0; font-size:9px; color:var(--tx-dim); letter-spacing:.12em; text-align:center}
+
+#hint{
+  position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:3;
+  font-size:10px; letter-spacing:.24em; color:var(--tx-dim); text-transform:uppercase;
+  pointer-events:none; transition:opacity 1.4s;
+}
+#hint.gone{opacity:0}
+#err{
+  position:fixed; inset:0; z-index:9; display:none; place-items:center;
+  background:rgba(2,4,9,.94); color:var(--hot); text-align:center; padding:24px;
+  font-size:13px; letter-spacing:.08em;
+}
+noscript{position:fixed; inset:0; z-index:9; display:grid; place-items:center; color:var(--hot)}
+@media (max-width:700px){
+  #panel{top:auto; bottom:10px; left:10px; right:10px; width:auto; max-height:46vh; overflow:auto}
+  #brand h1{font-size:12px}
+  #brand p{font-size:9px}
+  #hint{display:none}
+  .keys{display:none}
+}
+@media (prefers-reduced-motion: reduce){
+  #hint{transition:none}
+}
+</style>
+</head>
+<body>
+<div id="vignette" aria-hidden="true"></div>
+
+<header id="brand">
+  <h1>PATHGRID</h1>
+  <p>volumetric A* &middot; 26-connected &middot; rust&rarr;wasm</p>
+</header>
+
+<aside id="panel" aria-label="Pathfinder controls">
+  <div id="stStatus" data-s="ready" role="status" aria-live="polite">READY</div>
+  <div class="stats">
+    <div><span>EXPANDED</span><b id="stExp">0</b></div>
+    <div><span>FRONTIER</span><b id="stFro">0</b></div>
+    <div><span>PATH</span><b id="stPath">&mdash;</b></div>
+    <div><span>COST</span><b id="stCost">&mdash;</b></div>
+  </div>
+  <div class="meta">CORE <b id="stCore">JS</b> &middot; <i id="stCells"></i> &middot; SEED <i id="stSeed"></i></div>
+  <div class="btns">
+    <button id="bPlay" class="primary" aria-keyshortcuts="Space">&#9654; RUN</button>
+    <button id="bStep">STEP</button>
+    <button id="bReset">RESET</button>
+    <button id="bRand">RANDOMIZE</button>
+  </div>
+  <div class="row"><label for="sSpeed">SPEED</label><input id="sSpeed" type="range" min="1" max="400" value="8"><output id="oSpeed" for="sSpeed">8</output></div>
+  <div class="row"><label for="sGrid">GRID</label><input id="sGrid" type="range" min="10" max="26" step="2" value="22"><output id="oGrid" for="sGrid">22&sup3;</output></div>
+  <div class="row"><label for="sDens">DENSITY</label><input id="sDens" type="range" min="0" max="40" value="18"><output id="oDens" for="sDens">18%</output></div>
+  <div class="tgs">
+    <label class="tg"><input type="checkbox" id="tCloud" checked><span>EXPLORED CLOUD</span></label>
+    <label class="tg"><input type="checkbox" id="tRotate" checked><span>AUTO-ROTATE</span></label>
+    <label class="tg"><input type="checkbox" id="tDiag" checked><span>DIAGONAL MOVES (26-DIR)</span></label>
+  </div>
+  <p class="keys">SPACE run &middot; S step &middot; R randomize</p>
+</aside>
+
+<div id="hint" aria-hidden="true">DRAG TO ORBIT &middot; SCROLL / PINCH TO ZOOM</div>
+<div id="err" role="alert"></div>
+<noscript><p>This visualizer requires JavaScript.</p></noscript>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script type="module">
+'use strict';
+
+/* ================================================================== */
+/* === SOLVER CORE BEGIN ===                                          */
+/* JS mirror of src/lib.rs — same constructor args, same constants,   */
+/* same costs, same duplicate-push BinaryHeap semantics. Keep in sync. */
+/* Index convention everywhere: idx = x + n*(y + n*z).                 */
+/* ================================================================== */
+
+const FREE = 0, OBST = 1, OPEN = 2, CLOSED = 3, PATH = 4; // must match src/lib.rs
+const SQRT_2 = Math.SQRT2;
+const SQRT_3 = Math.sqrt(3);
+const STEP_COST = [0, 1, SQRT_2, SQRT_3]; // indexed by axes touched
+const EPS = 1e-12;
+
+class MinHeap {
+  // Orders by lowest f, tie-break lowest h — mirrors the reversed Ord on
+  // the Rust max-heap Node.
+  constructor() { this.f = []; this.h = []; this.i = []; }
+  size() { return this.f.length; }
+  _lt(a, b) {
+    const F = this.f, H = this.h, I = this.i;
+    if (F[a] !== F[b]) return F[a] < F[b];
+    if (H[a] !== H[b]) return H[a] < H[b];
+    return I[a] > I[b];
+  }
+  _swap(a, b) {
+    const F = this.f, H = this.h, I = this.i; let t;
+    t = F[a]; F[a] = F[b]; F[b] = t;
+    t = H[a]; H[a] = H[b]; H[b] = t;
+    t = I[a]; I[a] = I[b]; I[b] = t;
+  }
+  push(f, h, i) {
+    this.f.push(f); this.h.push(h); this.i.push(i);
+    let c = this.f.length - 1;
+    while (c > 0) {
+      const p = (c - 1) >> 1;
+      if (this._lt(c, p)) { this._swap(c, p); c = p; } else break;
+    }
+  }
+  pop() {
+    const m = this.f.length;
+    if (!m) return -1;
+    const top = this.i[0];
+    this._swap(0, m - 1);
+    this.f.pop(); this.h.pop(); this.i.pop();
+    let c = 0; const k = this.f.length;
+    for (;;) {
+      const l = 2 * c + 1, r = l + 1; let s = c;
+      if (l < k && this._lt(l, s)) s = l;
+      if (r < k && this._lt(r, s)) s = r;
+      if (s === c) break;
+      this._swap(c, s); c = s;
+    }
+    return top;
+  }
+}
+
+class JsSolver {
+  constructor(n, blocked, sx, sy, sz, gx, gy, gz, diagonals) {
+    n = n | 0;
+    const total = n * n * n;
+    if (n < 2) throw new Error('grid side must be >= 2');
+    if (blocked.length !== total) throw new Error('blocked must have n^3 entries');
+    this.n = n;
+    this.cells = new Uint8Array(total);
+    for (let i = 0; i < total; i++) if (blocked[i]) this.cells[i] = OBST;
+    this.gScore = new Float64Array(total).fill(Infinity);
+    this.parentOf = new Int32Array(total).fill(-1);
+    this.diagonals = !!diagonals;
+    this.startIdx = sx + n * (sy + n * sz);
+    this.goalIdx = gx + n * (gy + n * gz);
+    this.cells[this.startIdx] = FREE;
+    this.cells[this.goalIdx] = FREE;
+    this._expanded = 0;
+    this._frontier = 0;
+    this._done = false;
+    this._found = false;
+    this._cost = NaN;
+    this._path = new Uint32Array(0);
+    this.heap = new MinHeap();
+    this.gScore[this.startIdx] = 0;
+    const h = this._heur(this.startIdx);
+    this.cells[this.startIdx] = OPEN;
+    this._frontier = 1;
+    this.heap.push(h, h, this.startIdx);
+  }
+
+  _heur(idx) {
+    const n = this.n;
+    const x = idx % n, y = ((idx / n) | 0) % n, z = (idx / (n * n)) | 0;
+    const gi = this.goalIdx;
+    let a = Math.abs(x - gi % n);
+    let b = Math.abs(y - (((gi / n) | 0) % n));
+    let c = Math.abs(z - ((gi / (n * n)) | 0));
+    if (!this.diagonals) return a + b + c;
+    let t;
+    if (a < b) { t = a; a = b; b = t; }
+    if (b < c) { t = b; b = c; c = t; }
+    if (a < b) { t = a; a = b; b = t; }
+    return (a - b) + (b - c) * SQRT_2 + c * SQRT_3;
+  }
+
+  step_many(steps) {
+    for (let i = 0; i < steps; i++) {
+      if (this._done) break;
+      this._stepOnce();
+    }
+  }
+
+  _stepOnce() {
+    for (;;) {
+      if (this.heap.size() === 0) { this._done = true; this._found = false; return; }
+      const idx = this.heap.pop();
+      if (this.cells[idx] !== OPEN) continue; // stale duplicate, already CLOSED
+      this.cells[idx] = CLOSED;
+      this._frontier--;
+      this._expanded++;
+      if (idx === this.goalIdx) {
+        this._done = true;
+        this._found = true;
+        this._cost = this.gScore[idx];
+        this._buildPath();
+        return;
+      }
+      this._expand(idx);
+      return;
+    }
+  }
+
+  _expand(idx) {
+    const n = this.n, cells = this.cells, g = this.gScore;
+    const x = idx % n, y = ((idx / n) | 0) % n, z = (idx / (n * n)) | 0;
+    const g0 = g[idx];
+    for (let dz = -1; dz <= 1; dz++) {
+      const z2 = z + dz;
+      if (z2 < 0 || z2 >= n) continue;
+      for (let dy = -1; dy <= 1; dy++) {
+        const y2 = y + dy;
+        if (y2 < 0 || y2 >= n) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue;
+          const k = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
+          if (!this.diagonals && k > 1) continue;
+          const x2 = x + dx;
+          if (x2 < 0 || x2 >= n) continue;
+          const ni = x2 + n * (y2 + n * z2);
+          const st = cells[ni];
+          if (st === OBST || st === CLOSED) continue;
+          const ng = g0 + STEP_COST[k];
+          if (ng < g[ni] - EPS) {
+            g[ni] = ng;
+            this.parentOf[ni] = idx;
+            const h = this._heur(ni);
+            if (st !== OPEN) { cells[ni] = OPEN; this._frontier++; }
+            this.heap.push(ng + h, h, ni);
+          }
+        }
+      }
+    }
+  }
+
+  _buildPath() {
+    const rev = [this.goalIdx];
+    let cur = this.goalIdx;
+    while (cur !== this.startIdx) {
+      cur = this.parentOf[cur];
+      rev.push(cur);
+    }
+    rev.reverse();
+    for (const i of rev) this.cells[i] = PATH;
+    this._path = Uint32Array.from(rev);
+  }
+
+  // NOTE: returns a live read-only view (the WASM build returns a copy).
+  state() { return this.cells; }
+  state_ptr() { return 0; } // only meaningful in the WASM build
+  state_len() { return this.cells.length; }
+  path() { return this._path; }
+  expanded() { return this._expanded; }
+  frontier() { return this._frontier; }
+  is_done() { return this._done; }
+  found() { return this._found; }
+  cost() { return this._cost; }
+  free() {} // parity with wasm-bindgen objects
+}
+
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Perforated walls + floating clusters + scatter, all from one seeded PRNG
+// so "randomize" is reproducible. Start/goal neighbourhoods are carved free
+// last so they can never be boxed in by the generator.
+function generateMaze(n, density, seed) {
+  const rnd = mulberry32(seed);
+  const total = n * n * n;
+  const blocked = new Uint8Array(total);
+  const id = (x, y, z) => x + n * (y + n * z);
+  const put = (axis, p, u, v, val) => {
+    if (axis === 0) blocked[id(p, u, v)] = val;
+    else if (axis === 1) blocked[id(u, p, v)] = val;
+    else blocked[id(u, v, p)] = val;
+  };
+
+  // Perforated walls: full cross-section planes with punched holes.
+  const wallCount = n >= 18 ? 3 : 2;
+  const used = new Set();
+  for (let w = 0; w < wallCount; w++) {
+    const axis = (rnd() * 3) | 0;
+    let p = 2 + ((rnd() * (n - 4)) | 0);
+    for (let guard = 0; guard < 24 && (used.has(axis * 1000 + p) || used.has(axis * 1000 + p + 1) || used.has(axis * 1000 + p - 1)); guard++) {
+      p = 2 + ((rnd() * (n - 4)) | 0);
+    }
+    used.add(axis * 1000 + p);
+    for (let u = 0; u < n; u++) for (let v = 0; v < n; v++) put(axis, p, u, v, 1);
+    const holes = 1 + ((rnd() * 2) | 0);
+    for (let hi = 0; hi < holes; hi++) {
+      const hu = 1 + ((rnd() * (n - 2)) | 0);
+      const hv = 1 + ((rnd() * (n - 2)) | 0);
+      const r = n >= 16 ? 1 : (rnd() < 0.5 ? 1 : 0);
+      for (let du = -r; du <= r; du++) for (let dv = -r; dv <= r; dv++) {
+        const uu = hu + du, vv = hv + dv;
+        if (uu >= 0 && vv >= 0 && uu < n && vv < n) put(axis, p, uu, vv, 0);
+      }
+    }
+    // sparse perforation speckle
+    for (let u = 0; u < n; u++) for (let v = 0; v < n; v++) {
+      if (rnd() < 0.05) put(axis, p, u, v, 0);
+    }
+  }
+
+  // Floating clusters: ellipsoidal blobs suspended in the volume.
+  const blobs = 2 + Math.round(density * 14) + ((n / 9) | 0);
+  for (let b = 0; b < blobs; b++) {
+    const cx = 1 + rnd() * (n - 2), cy = 1 + rnd() * (n - 2), cz = 1 + rnd() * (n - 2);
+    const rx = 1 + rnd() * n * 0.11, ry = 1 + rnd() * n * 0.11, rz = 1 + rnd() * n * 0.11;
+    const x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(n - 1, Math.ceil(cx + rx));
+    const y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(n - 1, Math.ceil(cy + ry));
+    const z0 = Math.max(0, Math.floor(cz - rz)), z1 = Math.min(n - 1, Math.ceil(cz + rz));
+    for (let z = z0; z <= z1; z++) for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2;
+      if (d <= 1 && rnd() < 0.9) blocked[id(x, y, z)] = 1;
+    }
+  }
+
+  // Isolated scatter voxels.
+  const scatter = density * 0.35;
+  for (let i = 0; i < total; i++) if (rnd() < scatter) blocked[i] = 1;
+
+  // Carve the start/goal cells and their full 26-neighbourhoods free.
+  const start = [1, 1, 1], goal = [n - 2, n - 2, n - 2];
+  for (const [cx, cy, cz] of [start, goal]) {
+    for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const x = cx + dx, y = cy + dy, z = cz + dz;
+      if (x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z < n) blocked[id(x, y, z)] = 0;
+    }
+  }
+  return { blocked, start, goal };
+}
+
+/* === SOLVER CORE END === */
+/* ================================================================== */
+
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+function hash01(i) {
+  i = (i ^ 61) ^ (i >>> 16);
+  i = (i + (i << 3)) | 0;
+  i = i ^ (i >>> 4);
+  i = Math.imul(i, 0x27d4eb2d);
+  i = i ^ (i >>> 15);
+  return (i >>> 0) / 4294967296;
+}
+const $ = id => document.getElementById(id);
+
+function showErr(msg) {
+  const e = $('err');
+  e.textContent = msg;
+  e.style.display = 'grid';
+}
+
+async function main() {
+  if (typeof THREE === 'undefined') { showErr('Three.js failed to load — check your network / CDN access.'); return; }
+
+  /* ---- core selection: WASM if built, JS mirror otherwise ---------- */
+  // The swap is these three lines; `wasm-pack build --target web
+  // --out-dir web/pkg` makes them succeed and the WASM core takes over.
+  let SolverCtor = JsSolver, coreName = 'JS';
+  try {
+    const wasm = await import('./pkg/pathfind3d.js'); // 1. load the bindings
+    await wasm.default();                             // 2. instantiate the .wasm
+    SolverCtor = wasm.Solver;                         // 3. use it instead of the mirror
+    coreName = 'WASM';
+  } catch (_) { /* no pkg/ present — JS fallback keeps the demo alive */ }
+  $('stCore').textContent = coreName;
+
+  /* ---- renderer / scene ------------------------------------------- */
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+  } catch (e) { showErr('WebGL is unavailable in this browser.'); return; }
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.domElement.id = 'scene';
+  document.body.prepend(renderer.domElement);
+  const canvas = renderer.domElement;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x020409);
+  scene.fog = new THREE.Fog(0x020409, 70, 620);
+  const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 1200);
+
+  scene.add(new THREE.AmbientLight(0x2a3f55, 1.0));
+  const dir = new THREE.DirectionalLight(0x9fd8ff, 0.55);
+  dir.position.set(40, 90, 30);
+  scene.add(dir);
+
+  const LIFT = 2.6;        // cage floats above the floor grid
+  const WALL_DROP = 1.6;   // light-wall ribbon depth below the path curve
+  const REZ_T = 0.24;      // voxel rez-in duration (s)
+  const OPEN_OP = 0.6, CLOSED_OP = 0.26;
+
+  /* ---- floor grid + glowing horizon ------------------------------- */
+  const gridMinor = new THREE.GridHelper(900, 150, 0x0b4a5c, 0x07293a);
+  gridMinor.material.transparent = true;
+  gridMinor.material.opacity = 0.55;
+  scene.add(gridMinor);
+  const gridMajor = new THREE.GridHelper(900, 30, 0x12809b, 0x0d5468);
+  gridMajor.material.transparent = true;
+  gridMajor.material.opacity = 0.75;
+  gridMajor.position.y = 0.02;
+  scene.add(gridMajor);
+
+  {
+    // Horizon band: vertex-color brightness fades to black, which is
+    // invisible under additive blending — no alpha texture needed.
+    const hg = new THREE.CylinderGeometry(440, 440, 120, 72, 6, true);
+    const posAttr = hg.attributes.position;
+    const cols = new Float32Array(posAttr.count * 3);
+    const base = new THREE.Color(0x2fd4ff);
+    for (let i = 0; i < posAttr.count; i++) {
+      const t = posAttr.getY(i) / 120 + 0.5; // 0 bottom -> 1 top
+      const k = Math.pow(1 - t, 2.4) * 0.5;
+      cols[i * 3] = base.r * k; cols[i * 3 + 1] = base.g * k; cols[i * 3 + 2] = base.b * k;
+    }
+    hg.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    const horizon = new THREE.Mesh(hg, new THREE.MeshBasicMaterial({
+      vertexColors: true, transparent: true, blending: THREE.AdditiveBlending,
+      side: THREE.BackSide, depthWrite: false, fog: false,
+    }));
+    horizon.position.y = 56;
+    scene.add(horizon);
+  }
+
+  /* ---- shared assets ----------------------------------------------- */
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  const dummy = new THREE.Object3D();
+  const _v = new THREE.Vector3();
+
+  const glowTex = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.25, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    return new THREE.CanvasTexture(c);
+  })();
+  const makeGlow = (color, scale) => {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color, transparent: true, opacity: 0.85,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    s.scale.set(scale, scale, 1);
+    return s;
+  };
+
+  /* ---- start / goal markers (built once, repositioned per maze) ---- */
+  const startMarker = new THREE.Group();
+  const startOcta = new THREE.Mesh(new THREE.OctahedronGeometry(0.52), new THREE.MeshBasicMaterial({ color: 0x86f7ff }));
+  const startGlow = makeGlow(0x53f4ff, 3.2);
+  startMarker.add(startOcta, startGlow, new THREE.PointLight(0x53f4ff, 0.9, 14));
+  scene.add(startMarker);
+
+  const goalMarker = new THREE.Group();
+  const goalOcta = new THREE.Mesh(new THREE.OctahedronGeometry(0.52), new THREE.MeshBasicMaterial({ color: 0xffcf8e }));
+  const goalGlow = makeGlow(0xffa04d, 3.4);
+  goalMarker.add(goalOcta, goalGlow, new THREE.PointLight(0xff9b3d, 0.9, 14));
+  scene.add(goalMarker);
+
+  /* ---- the cycle (travelling marker) ------------------------------- */
+  const cycle = new THREE.Group();
+  const cycleBody = new THREE.Mesh(new THREE.OctahedronGeometry(0.42), new THREE.MeshBasicMaterial({ color: 0xffd9a0 }));
+  cycleBody.scale.set(0.55, 0.55, 1.6);
+  cycle.add(cycleBody, makeGlow(0xffa04d, 2.8), new THREE.PointLight(0xff9b3d, 1.5, 26));
+  cycle.visible = false;
+  scene.add(cycle);
+
+  /* ---- state ------------------------------------------------------- */
+  const ui = {
+    playing: false,
+    speed: 8,
+    showCloud: true,
+    autoRotate: !REDUCED,
+    diagonals: true,
+  };
+  let n = 22, densityPct = 18, seed = 41;
+  let blocked = null, start = null, goal = null;
+  let solver = null, total = 0;
+  let prevState = null, born = null;
+  let px = null, py = null, pz = null;
+
+  let volume = null, obsMesh = null, edgeLines = null, cageLines = null;
+  let openMesh = null, closedMesh = null, pathMesh = null;
+  let openMat = null, closedMat = null;
+
+  let dirty = true, animUntil = 0, handledDone = false;
+  let found = false, pathIdx = null, pathCost = 0;
+  let curve = null, wall = null, wallGeo = null, wallMat = null, wallSegs = 0;
+  let tube = null, tubeGeo = null, tubeSegs = 0;
+  const TUBE_RADIAL = 5;
+  let cycleT0 = 0, travelT = 4;
+
+  const cam = {
+    theta: 0.85, phi: 1.02, radius: 55,
+    rMin: 20, rMax: 300,
+    target: new THREE.Vector3(0, LIFT + 11, 0),
+  };
+
+  /* ---- world construction ------------------------------------------ */
+  function makeCloudMesh(color, opacity, order) {
+    const m = new THREE.InstancedMesh(unitBox, new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }), total);
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.renderOrder = order;
+    volume.add(m);
+    return m;
+  }
+
+  function rebuildVolume() {
+    if (volume) {
+      volume.traverse(o => {
+        if (o.isInstancedMesh) o.dispose();
+        if (o.geometry && o.geometry !== unitBox) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      });
+      scene.remove(volume);
+    }
+    total = n * n * n;
+    const half = (n - 1) / 2;
+    px = new Float32Array(total); py = new Float32Array(total); pz = new Float32Array(total);
+    for (let i = 0; i < total; i++) {
+      px[i] = (i % n) - half;
+      py[i] = LIFT + 0.5 + (((i / n) | 0) % n);
+      pz[i] = ((i / (n * n)) | 0) - half;
+    }
+
+    volume = new THREE.Group();
+    scene.add(volume);
+
+    // obstacles: matte dark instanced voxels
+    let obsCount = 0;
+    for (let i = 0; i < total; i++) if (blocked[i]) obsCount++;
+    obsMesh = new THREE.InstancedMesh(unitBox, new THREE.MeshLambertMaterial({ color: 0x0c1826 }), Math.max(1, obsCount));
+    let w = 0;
+    for (let i = 0; i < total; i++) {
+      if (!blocked[i]) continue;
+      dummy.position.set(px[i], py[i], pz[i]);
+      dummy.scale.setScalar(0.86);
+      dummy.updateMatrix();
+      obsMesh.setMatrixAt(w++, dummy.matrix);
+    }
+    obsMesh.count = obsCount;
+    obsMesh.instanceMatrix.needsUpdate = true;
+    obsMesh.frustumCulled = false;
+    volume.add(obsMesh);
+
+    // neon rims on surface obstacle cells only (interior edges just z-fight)
+    const epos = [];
+    const hb = 0.46;
+    const E = [
+      [-hb,-hb,-hb, hb,-hb,-hb], [-hb, hb,-hb, hb, hb,-hb], [-hb,-hb, hb, hb,-hb, hb], [-hb, hb, hb, hb, hb, hb],
+      [-hb,-hb,-hb,-hb, hb,-hb], [ hb,-hb,-hb, hb, hb,-hb], [-hb,-hb, hb,-hb, hb, hb], [ hb,-hb, hb, hb, hb, hb],
+      [-hb,-hb,-hb,-hb,-hb, hb], [ hb,-hb,-hb, hb,-hb, hb], [-hb, hb,-hb,-hb, hb, hb], [ hb, hb,-hb, hb, hb, hb],
+    ];
+    const isBlocked = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z < n && blocked[x + n * (y + n * z)];
+    for (let i = 0; i < total; i++) {
+      if (!blocked[i]) continue;
+      const x = i % n, y = ((i / n) | 0) % n, z = (i / (n * n)) | 0;
+      const surface = !isBlocked(x+1,y,z) || !isBlocked(x-1,y,z) || !isBlocked(x,y+1,z) ||
+                      !isBlocked(x,y-1,z) || !isBlocked(x,y,z+1) || !isBlocked(x,y,z-1);
+      if (!surface) continue;
+      for (const e of E) {
+        epos.push(px[i]+e[0], py[i]+e[1], pz[i]+e[2], px[i]+e[3], py[i]+e[4], pz[i]+e[5]);
+      }
+    }
+    const eg = new THREE.BufferGeometry();
+    eg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(epos), 3));
+    edgeLines = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({
+      color: 0x1f8fb4, transparent: true, opacity: 0.5,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    edgeLines.frustumCulled = false;
+    edgeLines.renderOrder = 1;
+    volume.add(edgeLines);
+
+    // bounding cage
+    const cg = new THREE.EdgesGeometry(new THREE.BoxGeometry(n + 0.15, n + 0.15, n + 0.15));
+    cageLines = new THREE.LineSegments(cg, new THREE.LineBasicMaterial({
+      color: 0x2fb6d8, transparent: true, opacity: 0.45,
+    }));
+    cageLines.position.set(0, LIFT + n / 2, 0);
+    volume.add(cageLines);
+
+    // search clouds + path voxels
+    openMesh = makeCloudMesh(0x53f4ff, OPEN_OP, 2);
+    closedMesh = makeCloudMesh(0x1c55ff, CLOSED_OP, 2);
+    pathMesh = makeCloudMesh(0xffb054, 0.9, 3);
+    openMat = openMesh.material;
+    closedMat = closedMesh.material;
+    openMesh.visible = closedMesh.visible = ui.showCloud;
+
+    // markers
+    const cw = (x, y, z) => _v.set(x - half, LIFT + 0.5 + y, z - half);
+    startMarker.position.copy(cw(start[0], start[1], start[2]));
+    goalMarker.position.copy(cw(goal[0], goal[1], goal[2]));
+
+    // framing
+    cam.target.set(0, LIFT + n / 2, 0);
+    cam.rMin = n * 1.15;
+    cam.rMax = Math.min(400, n * 7 + 40);
+    cam.radius = clamp(n * 2.45, cam.rMin, cam.rMax);
+    scene.fog.near = n * 3.2;
+
+    $('stCells').textContent = `${n}³ · ${total.toLocaleString()} CELLS`;
+    $('stSeed').textContent = seed;
+  }
+
+  /* ---- solver lifecycle -------------------------------------------- */
+  function resetSearch() {
+    removePathVisuals();
+    if (solver) solver.free();
+    solver = new SolverCtor(n, blocked, start[0], start[1], start[2], goal[0], goal[1], goal[2], ui.diagonals);
+    prevState = new Uint8Array(solver.state()); // copy — JS core returns a live view
+    born = new Float32Array(total).fill(-9);
+    handledDone = false;
+    openMat.opacity = OPEN_OP;
+    closedMat.opacity = CLOSED_OP;
+    dirty = true;
+    animUntil = 0;
+  }
+
+  function regenerate(newSeed) {
+    if (newSeed !== undefined) seed = newSeed;
+    ({ blocked, start, goal } = generateMaze(n, densityPct / 100, seed));
+    rebuildVolume();
+    resetSearch();
+  }
+
+  /* ---- light wall + cycle ------------------------------------------ */
+  function makeWallMaterial() {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        uColor: { value: new THREE.Color(0xff9b3d) },
+        uTime: { value: 0 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 uColor;
+        uniform float uTime;
+        varying vec2 vUv;
+        void main() {
+          float fade = vUv.y;                     /* 0 bottom -> 1 at the path */
+          float hot  = pow(fade, 4.0);            /* searing top edge */
+          float scan = 0.85 + 0.15 * sin(vUv.x * 170.0 - uTime * 2.6);
+          float a = (0.10 + 0.42 * fade + 0.6 * hot) * scan;
+          gl_FragColor = vec4(uColor * (0.5 + 1.15 * hot + 0.35 * fade), a);
+        }`,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+  }
+
+  function buildPathVisuals() {
+    const pts = pathIdx.map(i => new THREE.Vector3(px[i], py[i], pz[i]));
+    if (pts.length < 2) return;
+    curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
+
+    const S = Math.min(560, Math.max(48, pts.length * 8));
+    wallSegs = S - 1;
+    const pos = new Float32Array(S * 2 * 3);
+    const uv = new Float32Array(S * 2 * 2);
+    const index = new Uint16Array(wallSegs * 6);
+    for (let i = 0; i < S; i++) {
+      const p = curve.getPointAt(i / (S - 1));
+      const o = i * 6;
+      pos[o] = p.x; pos[o + 1] = p.y; pos[o + 2] = p.z;
+      pos[o + 3] = p.x; pos[o + 4] = p.y - WALL_DROP; pos[o + 5] = p.z;
+      const u = i / (S - 1), uo = i * 4;
+      uv[uo] = u; uv[uo + 1] = 1;
+      uv[uo + 2] = u; uv[uo + 3] = 0;
+    }
+    for (let i = 0; i < wallSegs; i++) {
+      const a = i * 2, b = a + 1, c = a + 2, d = a + 3, o = i * 6;
+      index[o] = a; index[o + 1] = b; index[o + 2] = c;
+      index[o + 3] = b; index[o + 4] = d; index[o + 5] = c;
+    }
+    wallGeo = new THREE.BufferGeometry();
+    wallGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    wallGeo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    wallGeo.setIndex(new THREE.BufferAttribute(index, 1));
+    wallMat = makeWallMaterial();
+    wall = new THREE.Mesh(wallGeo, wallMat);
+    wall.frustumCulled = false;
+    wall.renderOrder = 4;
+    scene.add(wall);
+
+    tubeSegs = Math.min(400, Math.max(32, pts.length * 6));
+    tubeGeo = new THREE.TubeGeometry(curve, tubeSegs, 0.075, TUBE_RADIAL, false);
+    tube = new THREE.Mesh(tubeGeo, new THREE.MeshBasicMaterial({
+      color: 0xffd9a0, transparent: true, opacity: 0.95,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    tube.frustumCulled = false;
+    tube.renderOrder = 4;
+    scene.add(tube);
+
+    setReveal(REDUCED ? 1 : 0);
+    cycle.visible = true;
+  }
+
+  function setReveal(p) {
+    if (wallGeo) wallGeo.setDrawRange(0, Math.max(0, Math.floor(p * wallSegs)) * 6);
+    if (tubeGeo) tubeGeo.setDrawRange(0, Math.max(0, Math.floor(p * tubeSegs)) * TUBE_RADIAL * 6);
+  }
+
+  function removePathVisuals() {
+    if (wall) { scene.remove(wall); wallGeo.dispose(); wallMat.dispose(); wall = wallGeo = wallMat = null; }
+    if (tube) { scene.remove(tube); tubeGeo.dispose(); tube.material.dispose(); tube = tubeGeo = null; }
+    curve = null;
+    cycle.visible = false;
+    found = false;
+    pathIdx = null;
+  }
+
+  function onDone(now) {
+    ui.playing = false;
+    syncPlayBtn();
+    dirty = true;
+    if (solver.found()) {
+      found = true;
+      pathIdx = Array.from(solver.path());
+      pathCost = solver.cost();
+      buildPathVisuals();
+      cycleT0 = now;
+      travelT = clamp(pathCost * 0.14, 2.6, 9);
+      // quiet the search cloud so the trail owns the frame
+      openMat.opacity = 0.26;
+      closedMat.opacity = 0.10;
+    }
+  }
+
+  /* ---- per-frame updates ------------------------------------------- */
+  function updateSearchMeshes(now) {
+    dirty = false;
+    const st = solver.state();
+    let no = 0, nc = 0;
+    for (let i = 0; i < total; i++) {
+      const s = st[i];
+      if (s !== prevState[i]) {
+        const was = prevState[i];
+        if (was === FREE || was === OBST) born[i] = now; // fresh rez, not a re-tint
+        prevState[i] = s;
+      }
+      if (s !== OPEN && s !== CLOSED) continue;
+      let k = 1;
+      if (!REDUCED) {
+        const age = now - born[i];
+        if (age < REZ_T) {
+          const t = Math.max(0, age / REZ_T);
+          k = t * t * (3 - 2 * t);
+          if (age < 0.16) k *= 0.62 + 0.5 * hash01(i * 131 + ((now * 90) | 0) * 911);
+        }
+      }
+      dummy.position.set(px[i], py[i], pz[i]);
+      if (s === OPEN) {
+        dummy.scale.setScalar(0.62 * k);
+        dummy.updateMatrix();
+        openMesh.setMatrixAt(no++, dummy.matrix);
+      } else {
+        dummy.scale.setScalar(0.46 * k);
+        dummy.updateMatrix();
+        closedMesh.setMatrixAt(nc++, dummy.matrix);
+      }
+    }
+    openMesh.count = no;
+    closedMesh.count = nc;
+    openMesh.instanceMatrix.needsUpdate = true;
+    closedMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  function updatePath(now) {
+    if (!found) {
+      if (pathMesh.count !== 0) { pathMesh.count = 0; pathMesh.instanceMatrix.needsUpdate = true; }
+      return;
+    }
+    let np = 0;
+    for (const i of pathIdx) {
+      const pulse = REDUCED ? 1 : 1 + 0.12 * Math.sin(now * 5 + np * 0.55);
+      dummy.position.set(px[i], py[i], pz[i]);
+      dummy.scale.setScalar(0.5 * pulse);
+      dummy.updateMatrix();
+      pathMesh.setMatrixAt(np++, dummy.matrix);
+    }
+    pathMesh.count = np;
+    pathMesh.instanceMatrix.needsUpdate = true;
+
+    if (!curve) return;
+    const elapsed = now - cycleT0;
+    let reveal, t;
+    if (REDUCED) {
+      reveal = 1;
+      t = 0; // parked at the start, no auto-traverse
+    } else {
+      reveal = Math.min(1, elapsed / travelT);
+      const lapT = travelT + 0.9; // brief hold at the goal between laps
+      t = Math.min(1, (elapsed % lapT) / travelT);
+    }
+    setReveal(reveal);
+    const p = curve.getPointAt(t);
+    cycle.position.copy(p);
+    const tan = curve.getTangentAt(Math.min(0.999, Math.max(0.001, t)));
+    cycle.lookAt(_v.copy(p).add(tan));
+    if (wallMat) wallMat.uniforms.uTime.value = REDUCED ? 0 : now;
+  }
+
+  function updateMarkers(now, dt) {
+    if (REDUCED) return;
+    startOcta.rotation.y += dt * 1.2;
+    goalOcta.rotation.y -= dt * 1.2;
+    const gp = 1 + 0.22 * Math.sin(now * 3.1);
+    goalGlow.scale.set(3.4 * gp, 3.4 * gp, 1);
+    const sp = 1 + 0.15 * Math.sin(now * 2.3 + 1.7);
+    startGlow.scale.set(3.2 * sp, 3.2 * sp, 1);
+  }
+
+  /* ---- orbit camera ------------------------------------------------ */
+  function applyCamera() {
+    cam.phi = clamp(cam.phi, 0.12, 1.52);
+    cam.radius = clamp(cam.radius, cam.rMin, cam.rMax);
+    const sp = Math.sin(cam.phi);
+    camera.position.set(
+      cam.target.x + cam.radius * sp * Math.sin(cam.theta),
+      cam.target.y + cam.radius * Math.cos(cam.phi),
+      cam.target.z + cam.radius * sp * Math.cos(cam.theta)
+    );
+    camera.lookAt(cam.target);
+  }
+
+  const pointers = new Map();
+  let pinchDist = 0, pinchRadius = 0;
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+      pinchRadius = cam.radius;
+    }
+    if (ui.autoRotate) { ui.autoRotate = false; $('tRotate').checked = false; }
+  });
+  canvas.addEventListener('pointermove', e => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pointers.size === 1) {
+      cam.theta -= dx * 0.0055;
+      cam.phi -= dy * 0.0045;
+    } else if (pointers.size === 2 && pinchDist > 0) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (d > 1) cam.radius = pinchRadius * pinchDist / d;
+    }
+  });
+  const endPointer = e => pointers.delete(e.pointerId);
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    cam.radius *= Math.exp(e.deltaY * 0.0011);
+  }, { passive: false });
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  /* ---- controls ----------------------------------------------------- */
+  const bPlay = $('bPlay');
+  function syncPlayBtn() {
+    bPlay.innerHTML = ui.playing ? '&#10073;&#10073; PAUSE' : '&#9654; RUN';
+  }
+  function togglePlay() {
+    if (!ui.playing && solver.is_done()) resetSearch(); // rerun from a finished state
+    ui.playing = !ui.playing;
+    syncPlayBtn();
+  }
+  function doStep() {
+    if (solver.is_done()) return;
+    ui.playing = false;
+    syncPlayBtn();
+    solver.step_many(1);
+    dirty = true;
+    animUntil = performance.now() / 1000 + 0.4;
+  }
+  function randomize() {
+    regenerate((Math.random() * 0x7fffffff) | 0);
+    ui.playing = true;
+    syncPlayBtn();
+  }
+
+  bPlay.addEventListener('click', togglePlay);
+  $('bStep').addEventListener('click', doStep);
+  $('bReset').addEventListener('click', () => { resetSearch(); ui.playing = false; syncPlayBtn(); });
+  $('bRand').addEventListener('click', randomize);
+
+  $('sSpeed').addEventListener('input', e => {
+    ui.speed = +e.target.value;
+    $('oSpeed').textContent = ui.speed;
+  });
+  $('sGrid').addEventListener('input', e => {
+    $('oGrid').innerHTML = `${e.target.value}&sup3;`;
+  });
+  $('sGrid').addEventListener('change', e => {
+    n = +e.target.value;
+    regenerate();
+    ui.playing = true;
+    syncPlayBtn();
+  });
+  $('sDens').addEventListener('input', e => {
+    $('oDens').textContent = `${e.target.value}%`;
+  });
+  $('sDens').addEventListener('change', e => {
+    densityPct = +e.target.value;
+    regenerate();
+    ui.playing = true;
+    syncPlayBtn();
+  });
+  $('tCloud').addEventListener('change', e => {
+    ui.showCloud = e.target.checked;
+    openMesh.visible = closedMesh.visible = ui.showCloud;
+    dirty = true;
+  });
+  $('tRotate').checked = ui.autoRotate;
+  $('tRotate').addEventListener('change', e => { ui.autoRotate = e.target.checked; });
+  $('tDiag').addEventListener('change', e => {
+    ui.diagonals = e.target.checked;
+    resetSearch();
+    ui.playing = true;
+    syncPlayBtn();
+  });
+
+  addEventListener('keydown', e => {
+    if (e.target.closest && e.target.closest('input,button,select,textarea')) return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    else if (e.key === 's' || e.key === 'S') doStep();
+    else if (e.key === 'r' || e.key === 'R') randomize();
+  });
+
+  /* ---- HUD ----------------------------------------------------------- */
+  const elStatus = $('stStatus'), elExp = $('stExp'), elFro = $('stFro'),
+        elPath = $('stPath'), elCost = $('stCost');
+  let lastStatus = '', lastExp = -1, lastFro = -1, lastPathLen = -1, lastCost = '';
+  function updateHud() {
+    const done = solver.is_done();
+    const txt = done ? (solver.found() ? 'PATH FOUND' : 'NO PATH')
+                     : (solver.expanded() > 0 ? 'SEARCHING' : 'READY');
+    if (txt !== lastStatus) {
+      lastStatus = txt;
+      elStatus.textContent = txt;
+      elStatus.dataset.s = done ? (solver.found() ? 'found' : 'nopath')
+                                : (solver.expanded() > 0 ? 'run' : 'ready');
+    }
+    const ex = solver.expanded(), fr = solver.frontier();
+    if (ex !== lastExp) { lastExp = ex; elExp.textContent = ex.toLocaleString(); }
+    if (fr !== lastFro) { lastFro = fr; elFro.textContent = fr.toLocaleString(); }
+    const pl = pathIdx ? pathIdx.length : -1;
+    if (pl !== lastPathLen) {
+      lastPathLen = pl;
+      elPath.textContent = pl < 0 ? '—' : pl;
+    }
+    const ct = found ? pathCost.toFixed(2) : '—';
+    if (ct !== lastCost) { lastCost = ct; elCost.textContent = ct; }
+  }
+
+  /* ---- boot ----------------------------------------------------------- */
+  regenerate();
+  ui.playing = true;
+  syncPlayBtn();
+  setTimeout(() => $('hint').classList.add('gone'), 6500);
+
+  let last = performance.now() / 1000;
+  function frame() {
+    requestAnimationFrame(frame);
+    const now = performance.now() / 1000;
+    const dt = Math.min(0.05, now - last);
+    last = now;
+
+    if (ui.playing && !solver.is_done()) {
+      solver.step_many(ui.speed);
+      dirty = true;
+      animUntil = now + 0.4;
+    }
+    if (!handledDone && solver.is_done()) {
+      handledDone = true;
+      onDone(now);
+    }
+    if (dirty || now < animUntil) updateSearchMeshes(now);
+    updatePath(now);
+    updateMarkers(now, dt);
+
+    if (ui.autoRotate && pointers.size === 0 && !REDUCED) cam.theta += dt * 0.1;
+    applyCamera();
+    renderer.render(scene, camera);
+    updateHud();
+  }
+  frame();
+}
+
+main().catch(err => {
+  console.error(err);
+  showErr(`Failed to start: ${err && err.message ? err.message : err}`);
+});
+</script>
+</body>
+</html>
