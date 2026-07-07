@@ -68,6 +68,8 @@ pub struct Solver {
     start: u32,
     goal: u32,
     diagonals: bool,
+    // Heuristic weight for weighted A* (w=1 → classic A*, w>1 → faster but suboptimal).
+    weight: f64,
     expanded: u32,
     frontier: u32,
     done: bool,
@@ -80,6 +82,8 @@ pub struct Solver {
 impl Solver {
     /// `blocked` must hold exactly `n^3` bytes (non-zero = obstacle),
     /// indexed as `x + n*(y + n*z)`.
+    /// `weight` scales the heuristic: 1.0 = classic A*, >1.0 = weighted A*
+    /// (expands fewer nodes, path cost ≤ weight × optimal).
     #[wasm_bindgen(constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -92,6 +96,7 @@ impl Solver {
         gy: u32,
         gz: u32,
         diagonals: bool,
+        weight: f64,
     ) -> Solver {
         assert!(n >= 2, "grid side must be >= 2");
         assert!(sx < n && sy < n && sz < n, "start out of bounds");
@@ -113,6 +118,7 @@ impl Solver {
         cells[start as usize] = FREE;
         cells[goal as usize] = FREE;
 
+        let weight = if weight < 1.0 { 1.0 } else { weight };
         let mut s = Solver {
             n: n as i32,
             cells,
@@ -122,6 +128,7 @@ impl Solver {
             start,
             goal,
             diagonals,
+            weight,
             expanded: 0,
             frontier: 0,
             done: false,
@@ -133,7 +140,7 @@ impl Solver {
         let h = s.heuristic(start);
         s.cells[start as usize] = OPEN;
         s.frontier = 1;
-        s.heap.push(Node { f: h, h, idx: start });
+        s.heap.push(Node { f: s.weight * h, h, idx: start });
         s
     }
 
@@ -187,6 +194,10 @@ impl Solver {
     /// Total path cost; NaN until a path is found.
     pub fn cost(&self) -> f64 {
         self.cost
+    }
+
+    pub fn weight(&self) -> f64 {
+        self.weight
     }
 }
 
@@ -287,7 +298,7 @@ impl Solver {
                             self.frontier += 1;
                         }
                         self.heap.push(Node {
-                            f: ng + h,
+                            f: ng + self.weight * h,
                             h,
                             idx: ni as u32,
                         });
@@ -334,7 +345,7 @@ mod tests {
     #[test]
     fn empty_3_cube_diagonals_optimal() {
         let blocked = vec![0u8; 27];
-        let s = run(Solver::new(3, &blocked, 0, 0, 0, 2, 2, 2, true));
+        let s = run(Solver::new(3, &blocked, 0, 0, 0, 2, 2, 2, true, 1.0));
         assert!(s.found());
         let want = 2.0 * SQRT_3;
         assert!(
@@ -351,7 +362,7 @@ mod tests {
     #[test]
     fn empty_3_cube_no_diagonals_manhattan() {
         let blocked = vec![0u8; 27];
-        let s = run(Solver::new(3, &blocked, 0, 0, 0, 2, 2, 2, false));
+        let s = run(Solver::new(3, &blocked, 0, 0, 0, 2, 2, 2, false, 1.0));
         assert!(s.found());
         assert!((s.cost() - 6.0).abs() < 1e-9, "cost {} want 6", s.cost());
         assert_eq!(s.path().len(), 7);
@@ -368,7 +379,7 @@ mod tests {
                 }
             }
         }
-        let s = run(Solver::new(n, &blocked, 0, 0, 0, 4, 4, 4, true));
+        let s = run(Solver::new(n, &blocked, 0, 0, 0, 4, 4, 4, true, 1.0));
         assert!(s.found());
         let hole = idx(n, 2, 2, 2);
         assert!(
@@ -401,7 +412,7 @@ mod tests {
                 }
             }
         }
-        let s = run(Solver::new(n, &blocked, 0, 0, 0, 3, 3, 3, true));
+        let s = run(Solver::new(n, &blocked, 0, 0, 0, 3, 3, 3, true, 1.0));
         assert!(s.is_done());
         assert!(!s.found());
         assert!(s.path().is_empty());
@@ -420,8 +431,8 @@ mod tests {
                 *b = 1;
             }
         }
-        let mut a = Solver::new(n, &blocked, 0, 0, 0, 7, 7, 7, true);
-        let mut b = Solver::new(n, &blocked, 0, 0, 0, 7, 7, 7, true);
+        let mut a = Solver::new(n, &blocked, 0, 0, 0, 7, 7, 7, true, 1.0);
+        let mut b = Solver::new(n, &blocked, 0, 0, 0, 7, 7, 7, true, 1.0);
         while !a.is_done() {
             a.step_many(1);
         }
@@ -445,7 +456,7 @@ mod tests {
                 }
             }
         }
-        let s = run(Solver::new(n, &blocked, 0, 0, 0, 6, 6, 6, true));
+        let s = run(Solver::new(n, &blocked, 0, 0, 0, 6, 6, 6, true, 1.0));
         assert!(s.found());
         let p = s.path();
         let mut acc = 0.0;
