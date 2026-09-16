@@ -1,0 +1,224 @@
+/* PATHGRID — presentation only. No layout decision here depends on what the
+   solver is doing; the markup exposes state through data-* attributes and
+   this file decides how it looks. */
+
+:root{
+  --cy:#4ff2ff; --cy-dim:#227e9b; --am:#ffb054; --hot:#ff6a4d;
+  --bg:#020409; --panel:rgba(5,12,22,.87); --line:rgba(79,242,255,.22);
+  --tx:#c9eef5; --tx-dim:#5d87a0;
+}
+*{box-sizing:border-box}
+/* The `hidden` attribute must win over any display rule set below — the route
+   buttons and scoreboard toggle through it. */
+[hidden]{display:none !important}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--tx); overflow:hidden;
+  font:13px/1.45 Consolas,"SF Mono",ui-monospace,Menlo,monospace;
+  -webkit-font-smoothing:antialiased;
+}
+
+canvas#scene{position:fixed; inset:0; display:block; touch-action:none; cursor:grab}
+canvas#scene:active{cursor:grabbing}
+body[data-tool="wall"] canvas#scene,
+body[data-tool="weight"] canvas#scene,
+body[data-tool="route"] canvas#scene{cursor:crosshair}
+/* Hovering a draggable endpoint always wins over the tool cursor. */
+body[data-grab="1"] canvas#scene{cursor:move}
+body[data-dragging="1"] canvas#scene{cursor:grabbing}
+
+#vignette{
+  position:fixed; inset:0; pointer-events:none; z-index:2;
+  background:radial-gradient(130% 130% at 50% 42%, transparent 52%, rgba(0,2,6,.62) 100%);
+}
+#brand{position:fixed; top:14px; left:16px; z-index:4; text-shadow:0 0 14px rgba(79,242,255,.35)}
+#brand h1{margin:0; font-size:15px; font-weight:700; letter-spacing:.38em; color:var(--cy)}
+
+/* About: opens on hover, on keyboard focus, or pinned open by a click
+   (aria-expanded), so it works for mouse, keyboard and touch alike. */
+.about{position:relative; display:inline-block; margin-top:6px; text-shadow:none}
+.aboutBtn{
+  min-height:0; padding:3px 9px; font-size:9px; letter-spacing:.24em;
+  color:var(--tx-dim); background:transparent; border-color:rgba(79,242,255,.18);
+}
+.aboutBtn:hover,.aboutBtn[aria-expanded="true"]{color:var(--cy); border-color:var(--line)}
+.aboutPop{
+  position:absolute; top:calc(100% + 8px); left:0; width:min(340px, calc(100vw - 32px));
+  padding:12px 14px; border:1px solid var(--line); border-radius:8px;
+  background:var(--panel); backdrop-filter:blur(8px);
+  box-shadow:0 0 26px rgba(0,229,255,.1);
+  font-size:11px; line-height:1.6; letter-spacing:.02em; color:var(--tx);
+  opacity:0; visibility:hidden; transform:translateY(-4px);
+  transition:opacity .16s, transform .16s, visibility 0s linear .16s;
+}
+.aboutPop p{margin:0 0 8px}
+.aboutPop .aboutTech{margin:0; font-size:9px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase}
+.about:hover .aboutPop,
+.about:focus-within .aboutPop,
+.aboutBtn[aria-expanded="true"] + .aboutPop{
+  opacity:1; visibility:visible; transform:none;
+  transition:opacity .16s, transform .16s, visibility 0s;
+}
+
+#panel{
+  position:fixed; top:14px; right:14px; z-index:4; width:270px; max-height:calc(100vh - 28px);
+  overflow:auto; overscroll-behavior:contain;
+  background:var(--panel); border:1px solid var(--line); border-radius:10px;
+  padding:12px; backdrop-filter:blur(8px);
+  box-shadow:0 0 26px rgba(0,229,255,.07), inset 0 0 18px rgba(0,229,255,.04);
+}
+
+#stStatus{
+  font-size:13px; font-weight:700; letter-spacing:.2em; text-align:center;
+  padding:6px 0 8px; color:var(--tx-dim);
+}
+#stStatus[data-s="run"]{color:var(--cy); text-shadow:0 0 10px rgba(79,242,255,.6)}
+#stStatus[data-s="found"]{color:var(--am); text-shadow:0 0 10px rgba(255,176,84,.6)}
+#stStatus[data-s="nopath"]{color:var(--hot); text-shadow:0 0 10px rgba(255,106,77,.5)}
+#stStatus[data-s="draw"],#stStatus[data-s="paused"]{color:var(--cy)}
+#stStatus[data-s="stale"]{color:var(--am)}
+
+.stats{display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px}
+.stats>div{
+  border:1px solid rgba(79,242,255,.12); border-radius:6px; padding:5px 8px;
+  display:flex; justify-content:space-between; align-items:baseline; gap:6px;
+}
+.stats span{font-size:9px; letter-spacing:.14em; color:var(--tx-dim)}
+.stats b{font-size:12px; color:var(--tx); font-weight:700; overflow:hidden; text-overflow:ellipsis}
+
+#cmp{border:1px solid rgba(255,176,84,.25); border-radius:6px; padding:6px 8px; margin-bottom:8px}
+.cmpRow{display:flex; justify-content:space-between; font-size:10px; letter-spacing:.12em; margin:2px 0}
+.cmpRow span{color:var(--tx-dim)} .cmpRow b{font-weight:700}
+.cmpRow.you b{color:var(--cy)} .cmpRow.opt b{color:#d9f2f7} .cmpRow.alg b{color:var(--am)}
+#cmpVerdict{font-size:9px; letter-spacing:.1em; color:var(--tx-dim); text-align:center; margin-top:4px; text-transform:uppercase}
+
+.meta{font-size:9px; letter-spacing:.1em; color:var(--tx-dim); text-align:center; margin-bottom:6px}
+.meta b{color:var(--am); font-weight:700}
+.meta i{font-style:normal; color:var(--tx)}
+
+button{
+  font:inherit; font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--cy); background:rgba(16,42,58,.5); border:1px solid var(--line);
+  border-radius:6px; padding:8px 4px; cursor:pointer; min-height:34px;
+}
+button:hover:not(:disabled){background:rgba(28,80,104,.6); box-shadow:0 0 10px rgba(79,242,255,.25)}
+button:active:not(:disabled){transform:translateY(1px)}
+button:disabled{opacity:.34; cursor:default}
+button.primary{color:#03202b; background:var(--cy); border-color:var(--cy); font-weight:700}
+button.primary:hover:not(:disabled){box-shadow:0 0 18px rgba(79,242,255,.6)}
+:focus-visible{outline:2px solid var(--cy); outline-offset:2px; border-radius:4px}
+
+/* ---- transport ------------------------------------------------------- */
+/* Five equal keys with RUN given the width it earns; every control here is
+   always present, so pausing never removes the way to step. */
+.transport{display:grid; grid-template-columns:1fr 1fr 2.1fr 1fr 1fr; gap:4px; margin-bottom:6px}
+.transport button{padding:8px 0; font-size:12px; letter-spacing:0}
+#bPlay{font-size:11px; letter-spacing:.1em}
+
+.scrub{display:grid; grid-template-columns:1fr auto; align-items:center; gap:8px; margin-bottom:8px}
+.scrub output{
+  font-size:9px; letter-spacing:.08em; color:var(--tx-dim); white-space:nowrap;
+  font-variant-numeric:tabular-nums;
+}
+#sScrub{width:100%; accent-color:var(--am); height:20px; background:transparent; cursor:pointer}
+
+.btns{display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:8px 0}
+
+select{
+  font:inherit; font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--tx); background:rgba(16,42,58,.5); border:1px solid var(--line);
+  border-radius:6px; padding:6px; width:100%; cursor:pointer; min-height:32px;
+}
+.desc{font-size:9px; letter-spacing:.08em; color:var(--tx-dim); margin:4px 1px 2px; min-height:12px}
+
+details{border-top:1px solid rgba(79,242,255,.14); margin-top:8px; padding-top:2px}
+summary{
+  font-size:10px; letter-spacing:.22em; color:var(--tx-dim); text-transform:uppercase;
+  cursor:pointer; padding:6px 0; list-style:none; user-select:none;
+}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▸ "; color:var(--cy-dim)}
+details[open] summary::before{content:"▾ "}
+summary:hover{color:var(--tx)}
+
+.row{
+  display:grid; grid-template-columns:62px 1fr 46px; align-items:center; gap:8px;
+  margin:7px 0; font-size:10px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase;
+}
+.row output{text-align:right; color:var(--tx); font-size:11px; font-variant-numeric:tabular-nums}
+input[type=range]{width:100%; accent-color:var(--cy); height:22px; background:transparent; cursor:pointer}
+#sWeight{
+  accent-color:var(--hot); border-radius:4px; height:14px;
+  background:linear-gradient(90deg,#2a1a0e,#8f4d20,#ff6a4d);
+}
+
+/* ---- tools ----------------------------------------------------------- */
+/* Four tools, each with its shortcut key shown on the face. Placing the
+   start and goal is not a tool: those markers are dragged directly. */
+.tools{display:grid; grid-template-columns:repeat(4,1fr); gap:5px; margin:6px 0}
+.tools button{padding:7px 2px; min-height:38px; font-size:9px; letter-spacing:.06em; line-height:1.3}
+.tools button kbd{
+  display:block; font:inherit; font-size:8px; opacity:.6; letter-spacing:.1em; margin-top:2px;
+}
+.tools button.on{color:#03202b; background:var(--cy); border-color:var(--cy); font-weight:700}
+.tools button.on kbd{opacity:.75}
+
+#toolHelp{
+  font-size:9px; letter-spacing:.06em; color:var(--tx-dim); line-height:1.5;
+  border-left:2px solid rgba(79,242,255,.2); padding:2px 0 2px 8px; margin:6px 0;
+  min-height:26px;
+}
+#routeBtns{display:grid; grid-template-columns:1fr 1fr; gap:5px; margin:6px 0}
+
+.tgs{display:grid; gap:6px; margin-top:6px}
+.tg{
+  display:flex; gap:9px; align-items:center; cursor:pointer;
+  font-size:10px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase; min-height:22px;
+}
+.tg input{accent-color:var(--cy); width:15px; height:15px; margin:0; cursor:pointer}
+.keys{margin:10px 0 0; font-size:9px; color:var(--tx-dim); letter-spacing:.1em; text-align:center; line-height:1.7}
+.keys b{color:var(--tx); font-weight:400}
+
+/* ---- hint bar -------------------------------------------------------- */
+#hint{
+  position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:3;
+  font-size:10px; letter-spacing:.2em; color:var(--tx-dim); text-transform:uppercase;
+  pointer-events:none; transition:opacity 1.4s; text-align:center; max-width:92vw;
+}
+#hint.gone{opacity:0}
+#hint.warn{color:var(--hot); transition:none}
+#cellReadout{
+  position:fixed; left:16px; bottom:18px; z-index:3; pointer-events:none;
+  font-size:10px; letter-spacing:.14em; color:var(--tx-dim); text-transform:uppercase;
+  font-variant-numeric:tabular-nums;
+}
+#cellReadout b{color:var(--cy); font-weight:400}
+#cellReadout em{font-style:normal; color:var(--hot)}
+#cellReadout:empty{display:none}
+
+#err{
+  position:fixed; inset:0; z-index:9; display:none; place-items:center;
+  background:rgba(2,4,9,.94); color:var(--hot); text-align:center; padding:24px;
+  font-size:13px; letter-spacing:.06em; line-height:1.8;
+}
+#err code{
+  display:block; margin-top:10px; color:var(--cy); font-size:12px;
+  letter-spacing:.02em; user-select:all;
+}
+noscript{position:fixed; inset:0; z-index:9; display:grid; place-items:center; color:var(--hot)}
+.srOnly{position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden}
+
+@media (max-width:760px){
+  #panel{top:auto; bottom:10px; left:10px; right:10px; width:auto; max-height:52vh}
+  #brand h1{font-size:12px}
+  #hint:not(.warn){display:none} /* warnings must stay visible on phones */
+  #hint.warn{bottom:56vh}
+  #cellReadout{display:none}
+  .keys{display:none}
+}
+@media (prefers-reduced-motion: reduce){
+  #hint{transition:none}
+  .aboutPop,.about:hover .aboutPop,.about:focus-within .aboutPop,
+  .aboutBtn[aria-expanded="true"] + .aboutPop{transition:none; transform:none}
+  button:active:not(:disabled){transform:none}
+}
