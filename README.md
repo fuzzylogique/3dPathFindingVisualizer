@@ -8,6 +8,8 @@ finds lights up as a neon trail.
 The search engine is written in Rust and compiled to WebAssembly. The visuals
 are rendered in the browser with Three.js.
 
+**[Try it live →](https://fuzzylogique.github.io/3dPathFindingVisualizer/)**
+
 ## Why I built it
 
 Pathfinding visualizers are a popular way to learn how A\*, Dijkstra and
