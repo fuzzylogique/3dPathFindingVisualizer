@@ -7,8 +7,6 @@ explored set grows as a glowing 3D cloud you can orbit around and see into;
 the found route renders as a neon **light wall** — a vertical ribbon extruded
 below the path curve — with a glowing cycle running the path.
 
-Edition 2 adds:
-
 - **Weighted cells** `w ∈ [1, 10]` — entering a cell costs
   `base_step_cost(dir) × w`; obstacles stay a separate hard-blocked state.
 - **Eight algorithms** behind one stepping loop: A\*, Dijkstra, Greedy
@@ -16,94 +14,111 @@ Edition 2 adds:
 - **Domains beyond the cube**: rectangular prism, pyramid, sphere, and a
   **torus** whose x axis genuinely wraps (rendered as a real donut — routes
   cross the modular seam).
-- **Interactive editing**: move start/goal, paint obstacles and weights into
-  3D space via a build-slice ghost layer or face-adjacency (voxel-editor
-  style), erase, clear, empty worlds.
-- **Challenge mode**: draw your own route (distant clicks auto-connect with an
-  internal BFS), then race the algorithm — your cost vs the true optimum vs
-  the displayed algorithm's result, all three paths drawn at once.
-- **Seeing through the volume**: auto-dim x-ray while searching, a clipping
-  plane that slices the volume open, and depth-test-free ghost passes so the
-  path, start, and goal are never fully hidden.
+- **Direct-manipulation editing**: drag the start and goal markers anywhere,
+  in any tool. Wall and weight brushes preview the exact cell they will hit.
+- **Full playback control**: run, pause, step forward, step *back*, and scrub
+  to any point in the search. Pausing survives edits and option changes.
+- **Challenge mode**: draw your own route (distant clicks auto-connect), then
+  race the algorithm — your cost vs the true optimum vs the displayed
+  algorithm's result, all three paths drawn at once.
 
-The solver is written in Rust and compiles to WebAssembly. The frontend is a
-single static `web/index.html` (Three.js r128 from CDN, custom orbit camera,
-no build step, no backend) that ships a line-for-line JS mirror of the Rust
-solver, so the demo runs immediately and the WASM core drops in when built.
+## Architecture: Rust computes, the browser draws
+
+**Every calculation lives in Rust**, compiled to WebAssembly: the domain
+shapes and their world-space layout, world generation, all eight searches,
+route validation and scoring, and turning a mouse ray into a cell. The
+browser holds no copy of the model. It reads cell states and positions
+straight out of wasm linear memory and renders them with Three.js.
 
 ```
 pathfind3d/
 ├── Cargo.toml
-├── src/lib.rs               # unified search engine + wasm-bindgen API + unit tests
-├── web/index.html           # Three.js frontend + JS mirror solver
-├── tests/mirror.test.mjs    # Node tests for the JS mirror (same invariants)
-└── README.md
+├── src/
+│   ├── lib.rs          # `World` — the single wasm-bindgen surface
+│   ├── domain.rs       # presets, existence masks, cell ↔ world-space mapping
+│   ├── terrain.rs      # seeded world generation (mulberry32)
+│   ├── solver.rs       # the unified search engine
+│   ├── route.rs        # route validation, costing, auto-connect
+│   └── pick.rs         # ray-march picking
+├── web/
+│   ├── index.html      # markup only
+│   ├── css/style.css   # all styling
+│   ├── js/             # rendering and input — no model logic
+│   │   ├── main.js     #   boot + frame loop
+│   │   ├── scene.js    #   renderer, camera, markers, set dressing
+│   │   ├── volume.js   #   voxel meshes, explored cloud, hover highlight
+│   │   ├── trails.js   #   light wall, route and optimal tubes
+│   │   ├── input.js    #   pointer + keyboard → World calls
+│   │   └── ui.js       #   control panel
+│   └── pkg/            # wasm-pack output (generated, not committed)
+└── tests/
+    ├── core.test.mjs   # the wasm boundary, from JavaScript
+    ├── e2e.test.mjs    # headless-browser tests over DevTools protocol
+    └── server.mjs      # static server for development and e2e
 ```
 
-## Run it now (no Rust required)
+Earlier editions shipped a hand-maintained JavaScript mirror of the solver
+as a fallback. It has been removed: one implementation, no drift.
 
-The page must be served over HTTP — `file://` blocks module scripts, and WASM
-needs the `application/wasm` MIME type.
+## Build and run
 
-```sh
-cd pathfind3d
-python -m http.server 8080 -d web
-# or: npx serve web
-```
-
-Open http://localhost:8080. The HUD shows `CORE JS` — the JS mirror solver is
-running. Behaviour, constants, costs, and API are identical to the Rust core.
-
-## Build the WASM core
+The WASM core is required — there is no fallback.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-pack          # once
-wasm-pack build --target web --out-dir web/pkg
+cargo install wasm-pack                                   # once
+wasm-pack build --target web --out-dir web/pkg --release
+node tests/server.mjs                                     # → http://127.0.0.1:8080
 ```
 
-Reload the page — the HUD flips to `CORE WASM`. Nothing else changes.
+The page must be served over HTTP: `file://` blocks ES modules, and WASM
+needs the `application/wasm` MIME type (the bundled server sets it; so does
+`python -m http.server 8080 -d web`). If the core is missing, the page says
+so and shows the build command instead of failing silently.
 
-### How the swap works
-
-`web/index.html` boots with the JS mirror and upgrades itself if `web/pkg/`
-exists. The swap is exactly three lines, already wired inside a `try/catch`:
-
-```js
-const wasm = await import('./pkg/pathfind3d.js'); // 1. load the bindings
-await wasm.default();                             // 2. instantiate the .wasm
-SolverCtor = wasm.Solver;                         // 3. use it instead of the mirror
-```
-
-## Solver API (identical in Rust/WASM and the JS mirror)
+## `World` API
 
 Index convention **everywhere**: `idx = x + nx*(y + ny*z)`.
 
 ```js
-new Solver(nx, ny, nz, terrain,
-           wrapX, wrapY, wrapZ,
-           sx, sy, sz, gx, gy, gz,
-           diagonals, algo)
+const world = new World(preset, size, densityPct, seed, startEmpty);
 ```
 
-`terrain` is a `Uint8Array` of `nx*ny*nz` bytes: `0` = **void** (outside the
-domain — untraversable, unrendered), `1..10` = existing cell with that
-**weight**, `255` = **obstacle**. Obstacles at the endpoints are carved free;
-an endpoint on a void cell reports *no path* immediately. `wrap*` enable
-per-axis toroidal connectivity (neighbour indexing goes modular).
+`preset` is `cube | prism | pyramid | sphere | torus`. Terrain bytes are `0` =
+**void** (outside the domain), `1..10` = a cell of that **weight**, `255` =
+**obstacle**.
 
-| Method | Returns | Notes |
-|---|---|---|
-| `step_many(steps)` | — | Advance by at most `steps` node expansions (stepped execution for animation). |
-| `state()` | `Uint8Array` | Per-cell: `FREE=0 OBST=1 OPEN=2 CLOSED=3 PATH=4`. Void cells always read FREE. WASM returns a copy; the JS mirror a live view. |
-| `path()` | `Uint32Array` | Cell indices start→goal; empty until solved. |
-| `expanded()` | `u32` | Nodes closed so far (both directions for Bidirectional Swarm). |
-| `frontier()` | `u32` | Open-set size (sum of both fronts for Bidirectional Swarm). |
-| `is_done()` / `found()` | `bool` | Done + not found = no path. |
-| `cost()` | `f64` | **True weighted cost of the returned path** (re-summed, so BFS/DFS report honest weighted costs); NaN until found. |
-| `algo()` / `start()` / `goal()` | ids | Introspection. |
-| `state_ptr()`, `state_len()` | ptr, `u32` | Zero-copy view into wasm memory (rebuild after any allocating call). |
-| `free()` | — | wasm-bindgen destructor (no-op in the mirror). |
+| Area | Methods |
+|---|---|
+| World | `rebuild(preset, size, density, seed, empty)`, `clear_terrain()`, `nx/ny/nz()`, `len()`, `cell_count()`, `preset()`, `seed()`, `label()`, `wraps()`, `curved()`, `bbox()`, `span()` |
+| Buffers | `state_ptr()`, `terrain_ptr()`, `exists_ptr()`, `pos_x/y/z_ptr()`, `rot_ptr()` — all `len()` long. **Rebuild typed-array views after any call that can allocate.** |
+| Instance lists | `obstacle_cells()`, `surface_obstacle_cells()`, `weighted_cells()` |
+| Endpoints | `start_cell()`, `goal_cell()`, `set_start(cell)`, `set_goal(cell)` — snap to the nearest legal cell and return the one used |
+| Search | `set_algo(id)`, `set_diagonals(on)`, `reset_search()`, `advance(n)`, `step_back(n)`, `seek(step)`, `total_steps()`, `expanded()`, `frontier()`, `is_done()`, `found()`, `cost()`, `path()`, `is_stale()` |
+| Editing | `paint(cell, value)`, `terrain_at(cell)` — refuses void cells and walling in an endpoint |
+| Picking | `pick_edit(ray…, includeWeighted)` → `[cellToClear, cellToPaint]`, `pick_endpoint(ray…, isStart)`, `pick_any(ray…)`, `pick_solid(ray…)`, `set_anchor(cell)`, `nudge_anchor(dir…, steps)` |
+| Routes | `route_begin()`, `route_append(cell)` → `0` ok / `-1` blocked / `-2` unreachable / `-3` finished, `route_undo()`, `route_clear()`, `route()`, `route_len()`, `route_complete()`, `route_cost()`, `route_error()`, `optimal_cost()`, `optimal_path()` |
+
+Cell states in the state buffer: `FREE=0 OBST=1 OPEN=2 CLOSED=3 PATH=4`.
+
+### How rewinding works
+
+The searches are deterministic, so `seek(n)` rebuilds the solver and replays
+`n` expansions rather than keeping an undo journal. There is no per-step
+history to store and no way for a journal to drift from the forward pass. A
+full search over the largest domain replays in a few milliseconds, which is
+fast enough to scrub.
+
+### How picking works
+
+A click into a 3D volume is depth-ambiguous. The core marches the camera ray
+in sub-cell steps, mapping each sample back to a cell through the inverse of
+the domain layout — which is why the curved torus needs no special case. One
+march yields the first wall hit (what a clear-click removes) and the open cell
+in front of it (where a paint-click builds). Through empty space, where there
+is no wall to build against, it intersects the ray with a camera-facing plane
+through an anchor cell instead; dragging a marker uses the same fallback
+anchored on the marker itself.
 
 ## The algorithms — one loop, swappable frontier + priority
 
@@ -140,43 +155,49 @@ priority `f = g_w·g + h_w·h` (`g` = cost so far, `h` = admissible heuristic):
   break A\*'s optimality (tested).
 - `BinaryHeap` has no decrease-key, so improved nodes are pushed as
   duplicates; a popped node that is no longer open in that search is skipped.
-  Ties break on lower `h`, then index, keeping JS and WASM bit-identical.
+  Ties break on lower `h`, then index, so runs are fully deterministic —
+  which is what lets the scrub bar rewind by replaying.
 
-## Frontend
+## Controls
 
-- **Controls:** Run/Pause, Step, Reset, Randomize, Clear; algorithm and domain
-  dropdowns (with one-line descriptions); sliders for speed, size, density,
-  weight brush (1–10, colour-ramped), build-slice layer, x-ray opacity, clip
-  depth; toggles for explored cloud, auto-rotate, 26- vs 6-connectivity,
-  start-empty, slice ghost, clip plane. `SPACE` run/pause, `S` step,
-  `R` randomize, `ESC` back to view mode, `[` `]` move the slice, arrow keys
-  orbit, `+`/`-` zoom.
-- **Edit modes:** VIEW (orbit), START/GOAL (click to move, snaps to the
-  nearest valid cell), WALL / WEIGHT / ERASE (paint via the slice ghost or by
-  clicking block faces; shift-click removes), ROUTE (challenge mode). In any
-  edit mode the right mouse button still orbits and the wheel moves the
-  slice. Edits recompute the path on release.
-- **Challenge mode:** the route starts at the start marker; each click
-  extends it (adjacent cells chain directly, distant clicks auto-connect via
-  BFS over open cells; clicking an earlier route cell rewinds). Reaching the
-  goal scores it: your cost vs the optimal cost (always computed with A\*,
-  whatever is on display) with the % over optimal, plus the displayed
-  algorithm's cost after it runs — user route in cyan, optimum in pale white,
-  algorithm trail in amber.
-- **Occlusion tools:** while a search runs, obstacles and weights auto-dim to
-  the x-ray opacity and recover on pause/finish; the clip slider slices the
-  volume open along any axis (Three.js clipping planes); path, start, goal,
-  and route render a second depth-test-free pass, desaturated where occluded,
-  so they read through geometry.
-- **Scene:** instanced voxels for obstacles (matte, neon-rimmed), weighted
-  cells as amber energy (brighter + larger = denser), frontier vs closed as
-  additive glowing clouds with rez-in flicker, Catmull-Rom light wall +
-  travelling cycle, emissive start/goal markers, per-domain wireframe hull
-  (box, pyramid cage, sphere rings, donut grid with a seam marker), floor
-  grid and lit horizon. Custom orbit camera; auto-rotate stops on
-  interaction.
-- Reduced motion (`prefers-reduced-motion`) disables flicker, auto-rotate,
-  and the auto-traversing cycle. No storage; all state is in memory.
+**Playback** — `⏮` rewind, `◀` step back, `RUN`/`PAUSE`, `▶` step forward,
+`⏭` run to the end, plus a scrub bar across every expansion. A change never
+resumes playback on its own: edits, algorithm and option changes restart the
+search but leave it paused if it was paused.
+
+**Endpoints** — drag the glowing start (cyan) or goal (amber) marker. It works
+in every tool; hovering a marker rings it to show it can be grabbed. Markers
+snap to the nearest open cell and never land in a wall or on each other.
+
+**Tools**
+
+| Tool | Key | Click | Alt-click / right-click |
+|---|---|---|---|
+| View | `V` | orbit | — |
+| Wall | `W` | build a wall against the face you point at | remove the wall |
+| Weight | `E` | paint a cell at the brush weight | reset to normal ground |
+| Route | `R` | extend your route; far clicks auto-connect | — |
+
+In Wall, Weight and Route a highlight shows exactly which cell a click will
+affect, and the bottom-left readout gives its coordinates and contents.
+Shift-scroll pushes the build plane deeper when there is nothing to build
+against. Edits apply on release.
+
+**Keyboard** — `Space` run/pause, `,` `.` step back/forward, `Home`/`End`
+rewind/run to end, `V W E R` tools, `N` randomize, `Esc` back to View, arrow
+keys orbit, `+`/`-` zoom.
+
+**Seeing through the volume** — walls auto-dim to x-ray while a search runs;
+a clip plane slices the volume open along any axis; the path, markers and
+routes draw a faint through-wall pass so they are never fully hidden.
+
+**Challenge mode** — the route starts at the start marker. Reaching the goal
+scores it against the true optimum (always A\*, whatever is on display), with
+the percentage over optimal and the displayed algorithm's cost. Your route is
+cyan, the optimum pale white, the algorithm's trail amber.
+
+Reduced motion (`prefers-reduced-motion`) disables flicker, auto-rotate and
+the auto-traversing cycle.
 
 The aesthetic is an original light-grid / lightcycle homage — no logos,
 characters, or vehicle designs are reproduced.
@@ -184,41 +205,35 @@ characters, or vehicle designs are reproduced.
 ## Tests
 
 ```sh
-cargo test                    # 17 Rust tests
-node tests/mirror.test.mjs    # 19 JS-mirror tests (same invariants)
+cargo test                     # 45 tests: algorithms, domains, picking, routes, World
+node tests/core.test.mjs       # 20 tests: the wasm boundary, driven from JavaScript
+node tests/e2e.test.mjs        # 17 tests: the real page in a headless browser
 ```
 
-Beyond the edition-1 canon (known-optimal costs on empty cubes, threading a
-one-hole wall, walled-off goal, stepped == batch execution, legal path
-steps), the suite covers the edition-2 invariants:
+`cargo test` carries the algorithm canon — known-optimal costs, Dijkstra ==
+A\* on weighted grids, BFS fewest-hops, wrap-aware admissibility, void cells
+never searched, stepped == batch for every algorithm — plus the picking
+round-trip for every preset (including the torus), seek/step-back exactness,
+and edits marking the search stale instead of restarting it.
 
-1. Dijkstra == A\* total cost on weighted random grids (both optimal).
-2. A high-weight cell forces the optimal path around it; lowering the weight
-   sends the path through. Exact costs asserted.
-3. BFS returns fewest hops on hand-checked cases — and demonstrably *not*
-   the least-cost route when weights punish its hop-path.
-4. Greedy / swarms / DFS return valid connected start-goal paths whose cost
-   is never below optimal, and agree with Dijkstra on reachability.
-5. Wraparound: endpoints on opposite x-faces cost 1 wrapped vs 8 flat, and
-   A\* still equals Dijkstra with wrap on (the heuristic stays admissible).
-6. Void cells never appear in any closed set or path; a goal in a masked-out
-   region reports no path.
-7. Bidirectional Swarm returns a valid connected stitched path.
-8. Stepped and batch execution match for **every** algorithm (including the
-   bidirectional alternation).
+`core.test.mjs` checks what Rust tests cannot: that the exported API behaves
+from JavaScript and that buffer views stay correct across heap growth.
 
-The JS mirror suite additionally checks the domain presets (masks, carved
-endpoints, torus wrap flags and that wrapping genuinely shortens routes) and
-the route validator used by challenge mode.
+`e2e.test.mjs` needs a Chromium-based browser (Edge or Chrome are found
+automatically; set `BROWSER=` otherwise). It drives real pointer input over
+the DevTools protocol — dragging both markers, hover-previewing and placing a
+wall, alt-click removal, keyboard shortcuts — and asserts that pausing
+survives edits and that every preset renders without console errors.
 
 ## Hosting
 
-Everything under `web/` is static.
+Everything under `web/` is static, but `web/pkg/` is generated and not
+committed, so the host must build it or you must deploy a built copy.
 
-- **Cloudflare Pages:** framework preset *None*, build command *(empty)* — or
-  `wasm-pack build --target web --out-dir web/pkg` if the image has Rust —
-  output directory `web`.
-- **GitHub Pages:** serve the repo root and link to `/pathfind3d/web/`, or copy
-  `web/` to `docs/` and enable Pages → `docs`.
-- Any static file host works; the only requirements are HTTP (not `file://`)
-  and, if you built the WASM core, a correct `.wasm` MIME type.
+- **Cloudflare Pages:** build command
+  `wasm-pack build --target web --out-dir web/pkg --release` (needs Rust in
+  the build image), output directory `web`.
+- **GitHub Pages:** build locally or in an Action, then publish `web/`
+  including `web/pkg/`.
+- Any static host works; the requirements are HTTP (not `file://`) and the
+  `application/wasm` MIME type.

@@ -1,677 +1,738 @@
-//! Volumetric pathfinding core for the 3D visualizer — edition 2.
+//! Volumetric pathfinding core for the 3D visualizer — edition 3.
+//!
+//! Everything that counts as a calculation lives in this crate: the shape of
+//! the world ([`domain`]), what is in it ([`terrain`]), the eight search
+//! algorithms ([`solver`]), route scoring ([`route`]) and turning a mouse ray
+//! into a cell ([`pick`]). The front end owns pixels and nothing else — it
+//! reads cell states and positions straight out of wasm linear memory and
+//! draws them.
+//!
+//! [`World`] is the single wasm-bindgen surface. It holds the domain, the
+//! terrain, the endpoints and the live solver, so the browser never has to
+//! keep a second copy of any of it in sync.
 //!
 //! Index convention everywhere: `idx = x + nx*(y + ny*z)`.
-//! The JS fallback solver in `web/index.html` mirrors this file exactly
-//! (same constructor arguments, same state constants, same costs, same
-//! expansion order), so keep the two in lock-step.
-//!
-//! One stepping loop drives every algorithm. An algorithm is a frontier
-//! structure (priority queue / FIFO queue / LIFO stack) plus a priority
-//! `f = g_w * g + h_w * h`:
-//!
-//! | algo                | frontier | g_w | h_w | optimal?      |
-//! |---------------------|----------|-----|-----|---------------|
-//! | A*                  | PQ       | 1   | 1   | yes           |
-//! | Dijkstra            | PQ       | 1   | 0   | yes           |
-//! | Greedy Best-First   | PQ       | 0   | 1   | no            |
-//! | Swarm               | PQ       | 1   | 1.5 | no            |
-//! | Convergent Swarm    | PQ       | 1   | 3   | no            |
-//! | Bidirectional Swarm | 2×PQ     | 1   | 1.5 | no            |
-//! | Breadth-First       | FIFO     | (hops)  | fewest hops   |
-//! | Depth-First         | LIFO     | (hops)  | no            |
-//!
-//! Cells carry a weight `w ∈ [1, W_MAX]`; entering a cell costs
-//! `base_step_cost(dir) * w` where base cost is Euclidean (1, √2, √3).
-//! Weights never drop below 1, so the Euclidean/octile heuristic never
-//! overestimates and A*/Dijkstra stay optimal. BFS/DFS ignore weights and
-//! count hops; their reported `cost()` is still the true weighted cost of
-//! the path they return (re-summed), so comparisons stay honest.
-//!
-//! Domains generalize the cube: per-axis dims, a per-cell existence mask
-//! (terrain value 0 = void), and per-axis toroidal wrap. On a wrapped axis
-//! the heuristic uses `min(|d|, n - |d|)` per axis — the raw delta would
-//! overestimate and break admissibility.
-
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::collections::VecDeque;
 
 use wasm_bindgen::prelude::*;
 
-// Cell states surfaced through `state()`. Must match the JS mirror.
+pub mod domain;
+pub mod pick;
+pub mod route;
+pub mod solver;
+pub mod terrain;
+
+use domain::{Domain, Preset};
+use solver::{Solver, ALGO_ASTAR, ALGO_DFS};
+
+// Cell states surfaced through `state_ptr`.
 pub const FREE: u8 = 0;
 pub const OBST: u8 = 1;
 pub const OPEN: u8 = 2;
 pub const CLOSED: u8 = 3;
 pub const PATH: u8 = 4;
 
-// Terrain encoding (constructor input). Must match the JS mirror.
-pub const T_VOID: u8 = 0; // not part of the domain: untraversable, unrendered
-pub const T_OBST: u8 = 255; // hard-blocked obstacle (infinite weight)
-pub const W_MAX: u8 = 10; // valid weights are 1..=W_MAX
+// Terrain encoding.
+/// Not part of the domain: untraversable and unrendered.
+pub const T_VOID: u8 = 0;
+/// Hard-blocked obstacle (infinite weight).
+pub const T_OBST: u8 = 255;
+/// Valid traversable weights are `1..=W_MAX`.
+pub const W_MAX: u8 = 10;
 
-// Algorithm ids. Must match the JS mirror and the UI dropdown.
-pub const ALGO_ASTAR: u8 = 0;
-pub const ALGO_DIJKSTRA: u8 = 1;
-pub const ALGO_GREEDY: u8 = 2;
-pub const ALGO_SWARM: u8 = 3;
-pub const ALGO_CONVERGENT: u8 = 4;
-pub const ALGO_BISWARM: u8 = 5;
-pub const ALGO_BFS: u8 = 6;
-pub const ALGO_DFS: u8 = 7;
-
-// Heuristic weights that make the swarm variants visibly distinct.
-const SWARM_H: f64 = 1.5;
-const CONVERGENT_H: f64 = 3.0;
-
-const SQRT_2: f64 = std::f64::consts::SQRT_2;
-const SQRT_3: f64 = 1.732_050_807_568_877_2;
-const STEP_COST: [f64; 4] = [0.0, 1.0, SQRT_2, SQRT_3]; // indexed by axes touched
-const NO_PARENT: u32 = u32::MAX;
-// Guard against float churn re-pushing a node whose g only "improved" by rounding noise.
-const EPS: f64 = 1e-12;
-
-// Frontier structures.
-const FR_PQ: u8 = 0;
-const FR_FIFO: u8 = 1;
-const FR_LIFO: u8 = 2;
-
-// Per-search cell status (separate from the shared viz buffer so the two
-// bidirectional searches never confuse each other's bookkeeping).
-const UNSEEN: u8 = 0;
-const S_OPEN: u8 = 1;
-const S_CLOSED: u8 = 2;
-
-/// Heap entry. `BinaryHeap` has no decrease-key, so improved nodes are pushed
-/// again as duplicates; stale entries are recognised on pop because the cell
-/// is no longer open in that search.
-#[derive(Copy, Clone)]
-struct Node {
-    f: f64,
-    h: f64,
-    idx: u32,
-}
-
-impl PartialEq for Node {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl Eq for Node {}
-
-impl Ord for Node {
-    // f64 isn't Ord; f and h are never NaN here. Comparison is reversed on
-    // (f, then h) so the lowest-f node counts as "greatest" and pops first
-    // out of the max-heap; final idx tiebreak keeps the order total.
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .f
-            .partial_cmp(&self.f)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| other.h.partial_cmp(&self.h).unwrap_or(Ordering::Equal))
-            .then_with(|| self.idx.cmp(&other.idx))
-    }
-}
-impl PartialOrd for Node {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// FIFO/LIFO frontier entry. The LIFO stack allows duplicates, so the entry
-/// carries the (parent, g) captured at push time; they are committed to the
-/// arrays when the entry is actually closed.
-#[derive(Copy, Clone)]
-struct QEntry {
-    idx: u32,
-    parent: u32,
-    g: f64,
-}
-
-/// One directional search: its own frontier, scores, parents and status.
-/// Single-frontier algorithms use exactly one; Bidirectional Swarm uses two
-/// (index 0 from the start, index 1 from the goal) that alternate expansions.
-struct Search {
-    heap: BinaryHeap<Node>,
-    fifo: VecDeque<QEntry>,
-    lifo: Vec<QEntry>,
-    g: Vec<f64>,
-    parent: Vec<u32>,
-    stat: Vec<u8>,
-    target: u32, // heuristic target (goal for the forward search, start for the reverse)
-}
-
-impl Search {
-    fn new(total: usize, target: u32) -> Search {
-        Search {
-            heap: BinaryHeap::new(),
-            fifo: VecDeque::new(),
-            lifo: Vec::new(),
-            g: vec![f64::INFINITY; total],
-            parent: vec![NO_PARENT; total],
-            stat: vec![UNSEEN; total],
-            target,
-        }
-    }
-}
+/// `route_append` outcomes, so the UI can say why a click was refused
+/// without re-deriving the reason.
+pub const ROUTE_OK: i32 = 0;
+pub const ROUTE_BLOCKED: i32 = -1;
+pub const ROUTE_UNREACHABLE: i32 = -2;
+pub const ROUTE_FINISHED: i32 = -3;
 
 #[wasm_bindgen]
-pub struct Solver {
-    nx: i32,
-    ny: i32,
-    nz: i32,
-    wrap: [bool; 3],
+pub struct World {
+    dom: Domain,
     terrain: Vec<u8>,
-    cells: Vec<u8>, // shared viz buffer: FREE/OBST/OPEN/CLOSED/PATH
-    searches: Vec<Search>,
-    turn: usize,
-    diagonals: bool,
-    algo: u8,
-    frontier_kind: u8,
-    g_w: f64,
-    h_w: f64,
+    preset: Preset,
+    size: u32,
+    density: u32,
+    seed: u32,
+    empty: bool,
+
     start: u32,
     goal: u32,
-    expanded: u32,
-    frontier: u32,
-    done: bool,
-    found: bool,
-    cost: f64,
-    path: Vec<u32>,
+    diagonals: bool,
+    algo: u8,
+
+    solver: Solver,
+    /// Set by any edit that invalidates the running search; the front end
+    /// resets when the gesture ends rather than restarting mid-stroke.
+    stale: bool,
+    /// Expansion count of a completed search, for the scrub bar. Computed on
+    /// demand and dropped whenever the world changes under it.
+    total_steps: Option<u32>,
+    /// Cached A* reference solve, used to score hand-drawn routes.
+    optimal: Option<(f64, Vec<u32>)>,
+
+    route: Vec<u32>,
+    /// Route lengths before each committed leg, so undo removes a whole leg.
+    route_marks: Vec<u32>,
+    /// Reference cell for building in open space, where there is no wall face
+    /// to place against.
+    anchor: u32,
 }
 
 #[wasm_bindgen]
-impl Solver {
-    /// `terrain` must hold exactly `nx*ny*nz` bytes, indexed `x + nx*(y + ny*z)`:
-    /// `0` = void (outside the domain), `1..=W_MAX` = existing cell with that
-    /// weight, `255` = obstacle. Other values are clamped into `1..=W_MAX`.
-    /// Obstacles at the endpoints are carved free (weight 1); an endpoint on a
-    /// void cell makes the search report "no path" immediately.
+impl World {
     #[wasm_bindgen(constructor)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        nx: u32,
-        ny: u32,
-        nz: u32,
-        terrain: &[u8],
-        wrap_x: bool,
-        wrap_y: bool,
-        wrap_z: bool,
-        sx: u32,
-        sy: u32,
-        sz: u32,
-        gx: u32,
-        gy: u32,
-        gz: u32,
-        diagonals: bool,
-        algo: u8,
-    ) -> Solver {
-        assert!(nx >= 1 && ny >= 1 && nz >= 1, "dims must be >= 1");
-        assert!(sx < nx && sy < ny && sz < nz, "start out of bounds");
-        assert!(gx < nx && gy < ny && gz < nz, "goal out of bounds");
-        assert!(algo <= ALGO_DFS, "unknown algorithm id");
-        let total = (nx as usize) * (ny as usize) * (nz as usize);
-        assert_eq!(terrain.len(), total, "terrain must have nx*ny*nz entries");
-
-        let start = sx + nx * (sy + ny * sz);
-        let goal = gx + nx * (gy + ny * gz);
-
-        // Sanitise terrain: keep void/obstacle markers, clamp weights into range.
-        let mut terrain: Vec<u8> = terrain
-            .iter()
-            .map(|&t| {
-                if t == T_VOID || t == T_OBST {
-                    t
-                } else if t > W_MAX {
-                    W_MAX
-                } else {
-                    t
-                }
-            })
-            .collect();
-        // The endpoints themselves must never be obstacles, whatever the
-        // generator produced. Void endpoints stay void: that is "no path".
-        if terrain[start as usize] == T_OBST {
-            terrain[start as usize] = 1;
-        }
-        if terrain[goal as usize] == T_OBST {
-            terrain[goal as usize] = 1;
-        }
-
-        let mut cells = vec![FREE; total];
-        for (i, &t) in terrain.iter().enumerate() {
-            if t == T_OBST {
-                cells[i] = OBST;
-            }
-        }
-
-        let (frontier_kind, g_w, h_w) = match algo {
-            ALGO_ASTAR => (FR_PQ, 1.0, 1.0),
-            ALGO_DIJKSTRA => (FR_PQ, 1.0, 0.0),
-            ALGO_GREEDY => (FR_PQ, 0.0, 1.0),
-            ALGO_SWARM => (FR_PQ, 1.0, SWARM_H),
-            ALGO_CONVERGENT => (FR_PQ, 1.0, CONVERGENT_H),
-            ALGO_BISWARM => (FR_PQ, 1.0, SWARM_H),
-            ALGO_BFS => (FR_FIFO, 1.0, 0.0),
-            _ => (FR_LIFO, 1.0, 0.0),
-        };
-
-        let mut searches = vec![Search::new(total, goal)];
-        if algo == ALGO_BISWARM {
-            searches.push(Search::new(total, start));
-        }
-
-        let mut s = Solver {
-            nx: nx as i32,
-            ny: ny as i32,
-            nz: nz as i32,
-            wrap: [wrap_x, wrap_y, wrap_z],
+    pub fn new(preset: &str, size: u32, density: u32, seed: u32, empty: bool) -> World {
+        let dom = Domain::preset(Preset::parse(preset), size);
+        let (start, goal) = (dom.start, dom.goal);
+        let mut terrain = terrain::generate(&dom, density, seed, empty);
+        terrain::sanitize(&mut terrain);
+        terrain::free_endpoints(&mut terrain, start, goal);
+        let solver = Solver::new(&dom, &terrain, start, goal, true, ALGO_ASTAR);
+        let anchor = dom.idx(dom.nx / 2, dom.ny / 2, dom.nz / 2);
+        World {
+            dom,
             terrain,
-            cells,
-            searches,
-            turn: 0,
-            diagonals,
-            algo,
-            frontier_kind,
-            g_w,
-            h_w,
+            preset: Preset::parse(preset),
+            size,
+            density,
+            seed,
+            empty,
             start,
             goal,
-            expanded: 0,
-            frontier: 0,
-            done: false,
-            found: false,
-            cost: f64::NAN,
-            path: Vec::new(),
-        };
-
-        // Degenerate cases resolved at construction.
-        if s.terrain[start as usize] == T_VOID || s.terrain[goal as usize] == T_VOID {
-            s.done = true;
-            s.found = false;
-            return s;
-        }
-        if start == goal {
-            s.done = true;
-            s.found = true;
-            s.cost = 0.0;
-            s.path = vec![start];
-            s.cells[start as usize] = PATH;
-            return s;
-        }
-
-        let origins: Vec<u32> = if algo == ALGO_BISWARM {
-            vec![start, goal]
-        } else {
-            vec![start]
-        };
-        for (si, &origin) in origins.iter().enumerate() {
-            let h = s.heuristic(origin, s.searches[si].target);
-            let (g_w, h_w, kind) = (s.g_w, s.h_w, s.frontier_kind);
-            let sr = &mut s.searches[si];
-            sr.g[origin as usize] = 0.0;
-            sr.stat[origin as usize] = S_OPEN;
-            match kind {
-                FR_PQ => sr.heap.push(Node {
-                    f: g_w * 0.0 + h_w * h,
-                    h,
-                    idx: origin,
-                }),
-                FR_FIFO => sr.fifo.push_back(QEntry {
-                    idx: origin,
-                    parent: NO_PARENT,
-                    g: 0.0,
-                }),
-                _ => sr.lifo.push(QEntry {
-                    idx: origin,
-                    parent: NO_PARENT,
-                    g: 0.0,
-                }),
-            }
-            s.frontier += 1;
-            if s.cells[origin as usize] == FREE {
-                s.cells[origin as usize] = OPEN;
-            }
-        }
-        s
-    }
-
-    /// Advance the search by at most `steps` node expansions (closes).
-    pub fn step_many(&mut self, steps: u32) {
-        for _ in 0..steps {
-            if self.done {
-                break;
-            }
-            self.step_once();
+            diagonals: true,
+            algo: ALGO_ASTAR,
+            solver,
+            stale: false,
+            total_steps: None,
+            optimal: None,
+            route: Vec::new(),
+            route_marks: Vec::new(),
+            anchor,
         }
     }
 
-    /// Per-cell state snapshot (copy): FREE=0 OBST=1 OPEN=2 CLOSED=3 PATH=4.
-    /// Void cells always read FREE; they never enter any frontier or path.
-    pub fn state(&self) -> Vec<u8> {
-        self.cells.clone()
+    /// Rebuild the world from scratch. Any argument left at its current value
+    /// is kept, so the UI can change one slider without restating the rest.
+    pub fn rebuild(&mut self, preset: &str, size: u32, density: u32, seed: u32, empty: bool) {
+        self.preset = Preset::parse(preset);
+        self.size = size;
+        self.density = density;
+        self.seed = seed;
+        self.empty = empty;
+        self.dom = Domain::preset(self.preset, size);
+        self.start = self.dom.start;
+        self.goal = self.dom.goal;
+        self.terrain = terrain::generate(&self.dom, density, seed, empty);
+        terrain::sanitize(&mut self.terrain);
+        terrain::free_endpoints(&mut self.terrain, self.start, self.goal);
+        self.anchor = self
+            .dom
+            .idx(self.dom.nx / 2, self.dom.ny / 2, self.dom.nz / 2);
+        self.route.clear();
+        self.route_marks.clear();
+        self.invalidate();
+        self.reset_search();
     }
 
-    /// Zero-copy alternative to `state()`: pointer into wasm linear memory.
-    /// View it with `new Uint8Array(memory.buffer, ptr, state_len())`;
-    /// rebuild the view after any call that may allocate (memory can grow).
+    /// Wipe obstacles and weights back to weight-1 ground, keeping the shape.
+    pub fn clear_terrain(&mut self) {
+        for i in 0..self.dom.total() {
+            if self.dom.exists[i] == 1 {
+                self.terrain[i] = 1;
+            }
+        }
+        self.route.clear();
+        self.route_marks.clear();
+        self.invalidate();
+        self.reset_search();
+    }
+
+    // ---- shape ---------------------------------------------------------
+
+    pub fn nx(&self) -> u32 {
+        self.dom.nx as u32
+    }
+    pub fn ny(&self) -> u32 {
+        self.dom.ny as u32
+    }
+    pub fn nz(&self) -> u32 {
+        self.dom.nz as u32
+    }
+    /// Number of cells in the buffers (`nx*ny*nz`, void cells included).
+    pub fn len(&self) -> u32 {
+        self.dom.total() as u32
+    }
+    pub fn is_empty(&self) -> bool {
+        self.dom.total() == 0
+    }
+    /// Number of cells that actually exist (outside the void mask).
+    pub fn cell_count(&self) -> u32 {
+        self.dom.count
+    }
+    pub fn label(&self) -> String {
+        self.dom.label.clone()
+    }
+    pub fn preset(&self) -> String {
+        self.dom.preset.as_str().to_string()
+    }
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+    pub fn wraps(&self) -> Vec<u8> {
+        self.dom.wrap.iter().map(|&w| w as u8).collect()
+    }
+    /// World-space bounds of the existing cell centres: `[minX, minY, minZ,
+    /// maxX, maxY, maxZ]`.
+    pub fn bbox(&self) -> Vec<f32> {
+        let b = &self.dom;
+        vec![
+            b.bmin[0], b.bmin[1], b.bmin[2], b.bmax[0], b.bmax[1], b.bmax[2],
+        ]
+    }
+    pub fn span(&self) -> f32 {
+        self.dom.span()
+    }
+
+    // ---- buffers -------------------------------------------------------
+    //
+    // Pointers into wasm linear memory. Rebuild the typed-array view after
+    // any call that can allocate — growing the heap detaches old views — so
+    // the front end simply re-derives them every frame.
+
+    pub fn exists_ptr(&self) -> *const u8 {
+        self.dom.exists.as_ptr()
+    }
+    pub fn terrain_ptr(&self) -> *const u8 {
+        self.terrain.as_ptr()
+    }
+    /// Per-cell search state: FREE=0 OBST=1 OPEN=2 CLOSED=3 PATH=4.
     pub fn state_ptr(&self) -> *const u8 {
-        self.cells.as_ptr()
+        self.solver.cells().as_ptr()
+    }
+    pub fn pos_x_ptr(&self) -> *const f32 {
+        self.dom.px.as_ptr()
+    }
+    pub fn pos_y_ptr(&self) -> *const f32 {
+        self.dom.py.as_ptr()
+    }
+    pub fn pos_z_ptr(&self) -> *const f32 {
+        self.dom.pz.as_ptr()
+    }
+    /// Per-cell Y rotation aligning a cube with the ring frame; all zero
+    /// unless `curved()`.
+    pub fn rot_ptr(&self) -> *const f32 {
+        self.dom.rot.as_ptr()
+    }
+    pub fn curved(&self) -> bool {
+        self.dom.curved
     }
 
-    pub fn state_len(&self) -> u32 {
-        self.cells.len() as u32
+    // ---- endpoints -----------------------------------------------------
+
+    pub fn start_cell(&self) -> u32 {
+        self.start
+    }
+    pub fn goal_cell(&self) -> u32 {
+        self.goal
     }
 
-    /// Cell indices from start to goal; empty until a path is found.
-    pub fn path(&self) -> Vec<u32> {
-        self.path.clone()
+    /// Move the start. The cell is snapped to the nearest existing, unblocked
+    /// cell that is not the goal; returns the cell actually used, or `-1` if
+    /// nothing suitable was near. Cheap enough to call on every pointer move.
+    pub fn set_start(&mut self, cell: u32) -> i32 {
+        self.set_endpoint(cell, true)
     }
 
-    /// Total node closures so far. For Bidirectional Swarm both directions
-    /// count, and the meeting cell is closed by both searches, so a
-    /// successful run reports one more than the number of distinct cells.
-    pub fn expanded(&self) -> u32 {
-        self.expanded
+    pub fn set_goal(&mut self, cell: u32) -> i32 {
+        self.set_endpoint(cell, false)
     }
 
-    /// Current open-set size (sum of both fronts for Bidirectional Swarm).
-    pub fn frontier(&self) -> u32 {
-        self.frontier
+    fn set_endpoint(&mut self, cell: u32, is_start: bool) -> i32 {
+        let avoid = if is_start { self.goal } else { self.start } as i32;
+        let snapped = pick::snap(&self.dom, &self.terrain, cell, avoid);
+        if snapped < 0 {
+            return -1;
+        }
+        let snapped = snapped as u32;
+        let cur = if is_start { self.start } else { self.goal };
+        if cur == snapped {
+            return snapped as i32;
+        }
+        if is_start {
+            self.start = snapped;
+        } else {
+            self.goal = snapped;
+        }
+        // The endpoints changed, so a route drawn to the old ones is void.
+        self.route.clear();
+        self.route_marks.clear();
+        self.invalidate();
+        snapped as i32
     }
 
-    pub fn is_done(&self) -> bool {
-        self.done
-    }
-
-    pub fn found(&self) -> bool {
-        self.found
-    }
-
-    /// True weighted cost of the returned path (re-summed along the path, so
-    /// BFS/DFS report honest weighted costs too); NaN until a path is found.
-    pub fn cost(&self) -> f64 {
-        self.cost
-    }
+    // ---- search --------------------------------------------------------
 
     pub fn algo(&self) -> u8 {
         self.algo
     }
 
-    pub fn start(&self) -> u32 {
-        self.start
+    pub fn set_algo(&mut self, algo: u8) {
+        let algo = algo.min(ALGO_DFS);
+        if algo == self.algo {
+            return;
+        }
+        self.algo = algo;
+        self.total_steps = None;
+        self.reset_search();
     }
 
-    pub fn goal(&self) -> u32 {
-        self.goal
-    }
-}
-
-impl Solver {
-    fn coords(&self, idx: u32) -> (i32, i32, i32) {
-        let i = idx as i32;
-        (i % self.nx, (i / self.nx) % self.ny, i / (self.nx * self.ny))
+    pub fn diagonals(&self) -> bool {
+        self.diagonals
     }
 
-    fn axis_delta(&self, a: i32, b: i32, n: i32, wrapped: bool) -> f64 {
-        let d = (a - b).abs();
-        let d = if wrapped { d.min(n - d) } else { d };
-        d as f64
+    pub fn set_diagonals(&mut self, on: bool) {
+        if on == self.diagonals {
+            return;
+        }
+        self.diagonals = on;
+        // Adjacency changed underneath any drawn route.
+        self.route.clear();
+        self.route_marks.clear();
+        self.invalidate();
+        self.reset_search();
     }
 
-    /// Exact minimum base cost across an empty grid, hence admissible (and
-    /// consistent) since every weight is >= 1. On wrapped axes the per-axis
-    /// delta is min(|d|, n - |d|) — the raw delta would overestimate.
-    /// 26-connected: sort |deltas| as a >= b >= c, then
-    /// (a-b)*1 + (b-c)*sqrt2 + c*sqrt3. 6-connected: Manhattan.
-    fn heuristic(&self, idx: u32, target: u32) -> f64 {
-        let (x, y, z) = self.coords(idx);
-        let (tx, ty, tz) = self.coords(target);
-        let mut d = [
-            self.axis_delta(x, tx, self.nx, self.wrap[0]),
-            self.axis_delta(y, ty, self.ny, self.wrap[1]),
-            self.axis_delta(z, tz, self.nz, self.wrap[2]),
+    /// Rebuild the solver at expansion zero.
+    pub fn reset_search(&mut self) {
+        self.solver = Solver::new(
+            &self.dom,
+            &self.terrain,
+            self.start,
+            self.goal,
+            self.diagonals,
+            self.algo,
+        );
+        self.stale = false;
+    }
+
+    /// Advance the search by up to `steps` expansions.
+    pub fn advance(&mut self, steps: u32) {
+        self.solver
+            .step_many(&self.dom, &self.terrain, steps);
+    }
+
+    /// Jump to an exact expansion count. The searches are deterministic, so
+    /// rewinding is a replay from zero rather than an undo journal: no
+    /// per-step history to store, and no chance of the two drifting apart.
+    /// A full search over the largest supported domain replays in a couple of
+    /// milliseconds, which is what makes scrubbing viable at all.
+    pub fn seek(&mut self, step: u32) {
+        self.reset_search();
+        self.advance(step);
+    }
+
+    pub fn step_back(&mut self, steps: u32) {
+        let target = self.solver.expanded().saturating_sub(steps.max(1));
+        self.seek(target);
+    }
+
+    /// Expansions a completed search takes, for the scrub bar's range.
+    /// Computed once per world state and cached.
+    pub fn total_steps(&mut self) -> u32 {
+        if let Some(n) = self.total_steps {
+            return n;
+        }
+        let mut s = Solver::new(
+            &self.dom,
+            &self.terrain,
+            self.start,
+            self.goal,
+            self.diagonals,
+            self.algo,
+        );
+        s.run(&self.dom, &self.terrain);
+        let n = s.expanded();
+        self.total_steps = Some(n);
+        n
+    }
+
+    pub fn expanded(&self) -> u32 {
+        self.solver.expanded()
+    }
+    pub fn frontier(&self) -> u32 {
+        self.solver.frontier()
+    }
+    pub fn is_done(&self) -> bool {
+        self.solver.is_done()
+    }
+    pub fn found(&self) -> bool {
+        self.solver.found()
+    }
+    /// True weighted cost of the path found, or NaN before there is one.
+    pub fn cost(&self) -> f64 {
+        self.solver.cost()
+    }
+    pub fn path(&self) -> Vec<u32> {
+        self.solver.path().to_vec()
+    }
+    /// True when an edit has invalidated the displayed search.
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    // ---- editing -------------------------------------------------------
+
+    /// Every wall cell, for the renderer's instance list.
+    pub fn obstacle_cells(&self) -> Vec<u32> {
+        self.terrain
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t == T_OBST)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    /// Wall cells with at least one exposed face. Only these are worth
+    /// outlining — rims on buried cells just z-fight with their neighbours.
+    pub fn surface_obstacle_cells(&self) -> Vec<u32> {
+        const FACES: [(i32, i32, i32); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
         ];
-        if !self.diagonals {
-            return d[0] + d[1] + d[2];
-        }
-        d.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        (d[0] - d[1]) + (d[1] - d[2]) * SQRT_2 + d[2] * SQRT_3
+        self.terrain
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t == T_OBST)
+            .map(|(i, _)| i as u32)
+            .filter(|&i| {
+                FACES.iter().any(|&(dx, dy, dz)| {
+                    match self.dom.neighbor(i, dx, dy, dz) {
+                        // Off the edge of the domain counts as exposed.
+                        None => true,
+                        Some(j) => self.terrain[j as usize] != T_OBST,
+                    }
+                })
+            })
+            .collect()
     }
 
-    /// Pop the next closable entry from search `si`, skipping stale duplicates.
-    /// Returns (idx, parent, g) — parent/g are only meaningful for the LIFO
-    /// frontier, whose entries commit their bookkeeping at close time.
-    fn pop_valid(&mut self, si: usize) -> Option<QEntry> {
-        let sr = &mut self.searches[si];
-        match self.frontier_kind {
-            FR_PQ => loop {
-                let node = sr.heap.pop()?;
-                if sr.stat[node.idx as usize] == S_OPEN {
-                    return Some(QEntry {
-                        idx: node.idx,
-                        parent: sr.parent[node.idx as usize],
-                        g: sr.g[node.idx as usize],
-                    });
-                }
-            },
-            FR_FIFO => sr.fifo.pop_front(),
-            _ => loop {
-                let e = sr.lifo.pop()?;
-                if sr.stat[e.idx as usize] != S_CLOSED {
-                    return Some(e);
-                }
-            },
+    /// Cells carrying a traversal weight above 1, which the renderer draws as
+    /// glowing dense-energy fields.
+    pub fn weighted_cells(&self) -> Vec<u32> {
+        self.terrain
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| (2..=W_MAX).contains(&t))
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    pub fn terrain_at(&self, cell: u32) -> u8 {
+        if (cell as usize) < self.terrain.len() {
+            self.terrain[cell as usize]
+        } else {
+            T_VOID
         }
     }
 
-    fn step_once(&mut self) {
-        // Pick the next search with work left, starting from whose turn it is.
-        let ns = self.searches.len();
-        let mut si = self.turn % ns;
-        let mut entry = None;
-        for _ in 0..ns {
-            entry = self.pop_valid(si);
-            if entry.is_some() {
-                break;
+    /// Set one cell's terrain byte. Refuses void cells and refuses to wall in
+    /// an endpoint. Returns true when something actually changed.
+    pub fn paint(&mut self, cell: u32, value: u8) -> bool {
+        if !self.dom.exists_at(cell) {
+            return false;
+        }
+        let value = if value == T_OBST {
+            if cell == self.start || cell == self.goal {
+                return false;
             }
-            si = (si + 1) % ns;
-        }
-        let Some(e) = entry else {
-            // Every frontier exhausted before the searches met / reached the goal.
-            self.done = true;
-            self.found = false;
-            return;
+            T_OBST
+        } else {
+            value.clamp(1, W_MAX)
         };
+        if self.terrain[cell as usize] == value {
+            return false;
+        }
+        self.terrain[cell as usize] = value;
+        self.stale = true;
+        self.invalidate_caches();
+        true
+    }
 
-        let ui = e.idx as usize;
+    /// Drop cached derived values without touching the live solver — used
+    /// while a paint stroke is still in progress.
+    fn invalidate_caches(&mut self) {
+        self.total_steps = None;
+        self.optimal = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.stale = true;
+        self.invalidate_caches();
+    }
+
+    // ---- picking -------------------------------------------------------
+
+    /// First wall the ray meets, or `-1`. This is what a click erases.
+    pub fn pick_solid(&self, ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32) -> i32 {
+        pick::ray(&self.dom, &self.terrain, [ox, oy, oz], [dx, dy, dz], false).solid
+    }
+
+    /// The open cell a click would build into: the cell in front of the first
+    /// wall, or — through open space, where there is no face to build against
+    /// — where the ray crosses the camera-facing plane through the anchor.
+    pub fn pick_build(&self, ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32) -> i32 {
+        let hit = pick::ray(&self.dom, &self.terrain, [ox, oy, oz], [dx, dy, dz], false);
+        if hit.solid >= 0 && hit.free >= 0 {
+            return hit.free;
+        }
+        match pick::on_plane(&self.dom, [ox, oy, oz], [dx, dy, dz], self.anchor) {
+            Some(c) if self.dom.exists_at(c) && self.terrain[c as usize] != T_OBST => c as i32,
+            _ => hit.free,
+        }
+    }
+
+    /// Where an endpoint dragged under this ray should land: the same
+    /// resolution as `pick_build`, then snapped onto a legal cell.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pick_endpoint(
+        &self,
+        ox: f32,
+        oy: f32,
+        oz: f32,
+        dx: f32,
+        dy: f32,
+        dz: f32,
+        is_start: bool,
+    ) -> i32 {
+        let anchor = if is_start { self.start } else { self.goal };
+        let hit = pick::ray(&self.dom, &self.terrain, [ox, oy, oz], [dx, dy, dz], false);
+        let raw = if hit.solid >= 0 && hit.free >= 0 {
+            hit.free as u32
+        } else {
+            match pick::on_plane(&self.dom, [ox, oy, oz], [dx, dy, dz], anchor) {
+                Some(c) => c,
+                None if hit.free >= 0 => hit.free as u32,
+                None => return -1,
+            }
+        };
+        let avoid = if is_start { self.goal } else { self.start } as i32;
+        pick::snap(&self.dom, &self.terrain, raw, avoid)
+    }
+
+    /// One ray-march serving both halves of a brush gesture:
+    /// `[cell_to_clear, cell_to_paint]`, either of which may be `-1`.
+    ///
+    ///
+    /// `include_weighted` makes the march stop on weighted cells as well as
+    /// walls, which is what lets the weight brush grow a field outward rather
+    /// than passing through it. The pair comes back in one call because the
+    /// hover highlight needs both on every pointer move.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pick_edit(
+        &self,
+        ox: f32,
+        oy: f32,
+        oz: f32,
+        dx: f32,
+        dy: f32,
+        dz: f32,
+        include_weighted: bool,
+    ) -> Vec<i32> {
+        let hit = pick::ray(
+            &self.dom,
+            &self.terrain,
+            [ox, oy, oz],
+            [dx, dy, dz],
+            include_weighted,
+        );
+        let build = if hit.solid >= 0 && hit.free >= 0 {
+            hit.free
+        } else {
+            match pick::on_plane(&self.dom, [ox, oy, oz], [dx, dy, dz], self.anchor) {
+                Some(c) if self.dom.exists_at(c) && self.terrain[c as usize] != T_OBST => c as i32,
+                _ => hit.free,
+            }
+        };
+        vec![hit.solid, build]
+    }
+
+    /// Any existing cell under the ray — used for hover readouts.
+    pub fn pick_any(&self, ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32) -> i32 {
+        let hit = pick::ray(&self.dom, &self.terrain, [ox, oy, oz], [dx, dy, dz], false);
+        if hit.solid >= 0 {
+            hit.solid
+        } else {
+            hit.free
+        }
+    }
+
+    pub fn anchor(&self) -> u32 {
+        self.anchor
+    }
+
+    pub fn set_anchor(&mut self, cell: u32) {
+        if self.dom.exists_at(cell) {
+            self.anchor = cell;
+        }
+    }
+
+    /// Push the build plane `steps` cells along a world-space direction —
+    /// scrolling in an edit mode moves it toward or away from the camera.
+    pub fn nudge_anchor(&mut self, dx: f32, dy: f32, dz: f32, steps: f32) -> u32 {
+        let a = self.dom.world_of(self.anchor);
+        let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+        let p = [
+            a[0] + dx / len * steps,
+            a[1] + dy / len * steps,
+            a[2] + dz / len * steps,
+        ];
+        if let Some(c) = self.dom.world_to_cell(p[0], p[1], p[2]) {
+            if self.dom.exists_at(c) {
+                self.anchor = c;
+            }
+        }
+        self.anchor
+    }
+
+    // ---- hand-drawn routes ---------------------------------------------
+
+    pub fn route(&self) -> Vec<u32> {
+        self.route.clone()
+    }
+
+    pub fn route_len(&self) -> u32 {
+        self.route.len() as u32
+    }
+
+    pub fn route_complete(&self) -> bool {
+        self.route.len() > 1 && *self.route.last().unwrap() == self.goal
+    }
+
+    /// Extend the route to `cell`. Adjacent cells chain directly; a distant
+    /// click is bridged with a shortest-hop leg, so drawing in 3D never
+    /// demands placing every single cell. Clicking a cell already on the
+    /// route rewinds to it. Returns `ROUTE_OK` or a `ROUTE_*` reason.
+    pub fn route_append(&mut self, cell: u32) -> i32 {
+        if !self.dom.exists_at(cell) || self.terrain[cell as usize] == T_OBST {
+            return ROUTE_BLOCKED;
+        }
+        if self.route.is_empty() {
+            self.route.push(self.start);
+        }
+        if self.route_complete() {
+            return ROUTE_FINISHED;
+        }
+        let tail = *self.route.last().unwrap();
+        if cell == tail {
+            return ROUTE_FINISHED;
+        }
+        if let Some(at) = self.route.iter().position(|&c| c == cell) {
+            self.route.truncate(at + 1);
+            self.route_marks.retain(|&m| (m as usize) < self.route.len());
+            return ROUTE_OK;
+        }
+        let mark = self.route.len() as u32;
+        match route::connect(&self.dom, &self.terrain, tail, cell, self.diagonals) {
+            Some(leg) => {
+                self.route.extend_from_slice(&leg[1..]);
+                self.route_marks.push(mark);
+                ROUTE_OK
+            }
+            None => ROUTE_UNREACHABLE,
+        }
+    }
+
+    /// Drop the most recently added leg, or the last cell if the route was
+    /// built one neighbour at a time.
+    pub fn route_undo(&mut self) {
+        while self
+            .route_marks
+            .last()
+            .is_some_and(|&m| m as usize >= self.route.len())
         {
-            let sr = &mut self.searches[si];
-            if self.frontier_kind == FR_LIFO {
-                // Commit the branch this entry actually came from.
-                sr.parent[ui] = e.parent;
-                sr.g[ui] = e.g;
-            }
-            sr.stat[ui] = S_CLOSED;
+            self.route_marks.pop();
         }
-        self.cells[ui] = CLOSED;
-        self.frontier -= 1;
-        self.expanded += 1;
-        self.turn = (si + 1) % ns;
-
-        if ns == 2 {
-            // Bidirectional termination: the closed sets first intersect.
-            if self.searches[1 - si].stat[ui] == S_CLOSED {
-                self.finish_bidirectional(e.idx);
-                return;
-            }
-        } else if e.idx == self.goal {
-            self.done = true;
-            self.found = true;
-            self.path = self.walk_parents(0, self.goal);
-            self.finish_path();
-            return;
-        }
-
-        self.expand_from(si, e.idx);
-    }
-
-    fn expand_from(&mut self, si: usize, idx: u32) {
-        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
-        let (x, y, z) = self.coords(idx);
-        let g_here = self.searches[si].g[idx as usize];
-        let target = self.searches[si].target;
-        for dz in -1i32..=1 {
-            let mut z2 = z + dz;
-            if z2 < 0 || z2 >= nz {
-                if !self.wrap[2] {
-                    continue;
-                }
-                z2 = (z2 + nz) % nz;
-            }
-            for dy in -1i32..=1 {
-                let mut y2 = y + dy;
-                if y2 < 0 || y2 >= ny {
-                    if !self.wrap[1] {
-                        continue;
-                    }
-                    y2 = (y2 + ny) % ny;
-                }
-                for dx in -1i32..=1 {
-                    if dx == 0 && dy == 0 && dz == 0 {
-                        continue;
-                    }
-                    let k = (dx.abs() + dy.abs() + dz.abs()) as usize;
-                    if !self.diagonals && k > 1 {
-                        continue;
-                    }
-                    let mut x2 = x + dx;
-                    if x2 < 0 || x2 >= nx {
-                        if !self.wrap[0] {
-                            continue;
-                        }
-                        x2 = (x2 + nx) % nx;
-                    }
-                    let ni = (x2 + nx * (y2 + ny * z2)) as u32;
-                    if ni == idx {
-                        continue; // wrap on a 1-cell axis folds onto itself
-                    }
-                    let t = self.terrain[ni as usize];
-                    if t == T_VOID || t == T_OBST {
-                        continue;
-                    }
-                    let sr = &mut self.searches[si];
-                    let nu = ni as usize;
-                    if sr.stat[nu] == S_CLOSED {
-                        continue;
-                    }
-                    match self.frontier_kind {
-                        FR_PQ => {
-                            let ng = g_here + STEP_COST[k] * t as f64;
-                            if ng < sr.g[nu] - EPS {
-                                sr.g[nu] = ng;
-                                sr.parent[nu] = idx;
-                                if sr.stat[nu] == UNSEEN {
-                                    sr.stat[nu] = S_OPEN;
-                                    self.frontier += 1;
-                                    if self.cells[nu] == FREE {
-                                        self.cells[nu] = OPEN;
-                                    }
-                                }
-                                let h = self.heuristic(ni, target);
-                                let f = self.g_w * ng + self.h_w * h;
-                                self.searches[si].heap.push(Node { f, h, idx: ni });
-                            }
-                        }
-                        FR_FIFO => {
-                            // Unweighted hop search: first discovery is the
-                            // fewest-hops route, never re-pushed.
-                            if sr.stat[nu] == UNSEEN {
-                                sr.stat[nu] = S_OPEN;
-                                sr.g[nu] = g_here + 1.0;
-                                sr.parent[nu] = idx;
-                                sr.fifo.push_back(QEntry {
-                                    idx: ni,
-                                    parent: idx,
-                                    g: g_here + 1.0,
-                                });
-                                self.frontier += 1;
-                                if self.cells[nu] == FREE {
-                                    self.cells[nu] = OPEN;
-                                }
-                            }
-                        }
-                        _ => {
-                            // Depth-first: duplicates allowed so the newest
-                            // branch is always explored first; each entry
-                            // remembers the branch it came from.
-                            if sr.stat[nu] == UNSEEN {
-                                sr.stat[nu] = S_OPEN;
-                                self.frontier += 1;
-                                if self.cells[nu] == FREE {
-                                    self.cells[nu] = OPEN;
-                                }
-                            }
-                            sr.lifo.push(QEntry {
-                                idx: ni,
-                                parent: idx,
-                                g: g_here + 1.0,
-                            });
-                        }
-                    }
-                }
+        match self.route_marks.pop() {
+            Some(m) => self.route.truncate(m as usize),
+            None => {
+                let n = self.route.len().saturating_sub(1).max(1);
+                self.route.truncate(n);
             }
         }
+        if self.route.is_empty() {
+            self.route.push(self.start);
+        }
     }
 
-    /// Walk a search's parent chain from `from` back to its origin, returning
-    /// the cells ordered origin -> `from`.
-    fn walk_parents(&self, si: usize, from: u32) -> Vec<u32> {
-        let mut rev = vec![from];
-        let mut cur = from;
-        while self.searches[si].parent[cur as usize] != NO_PARENT {
-            cur = self.searches[si].parent[cur as usize];
-            rev.push(cur);
-        }
-        rev.reverse();
-        rev
+    pub fn route_clear(&mut self) {
+        self.route.clear();
+        self.route_marks.clear();
     }
 
-    /// Stitch the two half-paths at the meeting cell. The forward half runs
-    /// start -> meet; the reverse search's parent chain runs meet -> goal.
-    fn finish_bidirectional(&mut self, meet: u32) {
-        self.done = true;
-        self.found = true;
-        let mut path = self.walk_parents(0, meet); // start .. meet
-        let mut cur = self.searches[1].parent[meet as usize];
-        while cur != NO_PARENT {
-            path.push(cur);
-            cur = self.searches[1].parent[cur as usize];
+    pub fn route_begin(&mut self) {
+        if self.route.is_empty() {
+            self.route.push(self.start);
         }
-        self.path = path;
-        self.finish_path();
     }
 
-    /// True weighted cost of a path: per step, the Euclidean base cost of the
-    /// (wrap-aware) move times the weight of the cell being entered.
-    fn path_cost(&self, path: &[u32]) -> f64 {
-        let mut acc = 0.0;
-        for w in path.windows(2) {
-            let (ax, ay, az) = self.coords(w[0]);
-            let (bx, by, bz) = self.coords(w[1]);
-            let k = (self.axis_delta(ax, bx, self.nx, self.wrap[0])
-                + self.axis_delta(ay, by, self.ny, self.wrap[1])
-                + self.axis_delta(az, bz, self.nz, self.wrap[2])) as usize;
-            acc += STEP_COST[k] * self.terrain[w[1] as usize] as f64;
+    /// Weighted cost of the drawn route, or NaN if it is not a legal route
+    /// from start to goal.
+    pub fn route_cost(&self) -> f64 {
+        if self.route_error().is_some() {
+            return f64::NAN;
         }
-        acc
+        route::path_cost(&self.dom, &self.terrain, &self.route)
     }
 
-    fn finish_path(&mut self) {
-        self.cost = self.path_cost(&self.path);
-        for &i in &self.path {
-            self.cells[i as usize] = PATH;
+    /// Why the drawn route is not yet a legal start-to-goal path, or an empty
+    /// string when it is.
+    pub fn route_error(&self) -> Option<String> {
+        route::validate_route(
+            &self.dom,
+            &self.terrain,
+            &self.route,
+            self.start,
+            self.goal,
+            self.diagonals,
+        )
+        .map(|s| s.to_string())
+    }
+
+    // ---- optimal reference ----------------------------------------------
+
+    fn compute_optimal(&mut self) -> &(f64, Vec<u32>) {
+        if self.optimal.is_none() {
+            let mut s = Solver::new(
+                &self.dom,
+                &self.terrain,
+                self.start,
+                self.goal,
+                self.diagonals,
+                ALGO_ASTAR,
+            );
+            s.run(&self.dom, &self.terrain);
+            self.optimal = Some(if s.found() {
+                (s.cost(), s.path().to_vec())
+            } else {
+                (f64::NAN, Vec::new())
+            });
         }
+        self.optimal.as_ref().unwrap()
+    }
+
+    /// Cost of a genuinely optimal route, whatever algorithm is on display,
+    /// so the scoreboard never flatters a suboptimal one.
+    pub fn optimal_cost(&mut self) -> f64 {
+        self.compute_optimal().0
+    }
+
+    pub fn optimal_path(&mut self) -> Vec<u32> {
+        self.compute_optimal().1.clone()
     }
 }
 
@@ -679,501 +740,193 @@ impl Solver {
 mod tests {
     use super::*;
 
-    // ---------- helpers -------------------------------------------------
-
-    fn idx(nx: u32, ny: u32, x: u32, y: u32, z: u32) -> u32 {
-        x + nx * (y + ny * z)
+    fn world() -> World {
+        World::new("cube", 12, 18, 41, false)
     }
 
-    /// Uniform-weight terrain from an edition-1 style `blocked` array.
-    fn terrain_from_blocked(blocked: &[u8]) -> Vec<u8> {
-        blocked.iter().map(|&b| if b != 0 { T_OBST } else { 1 }).collect()
-    }
-
-    fn cube(
-        n: u32,
-        blocked: &[u8],
-        s: (u32, u32, u32),
-        g: (u32, u32, u32),
-        diagonals: bool,
-        algo: u8,
-    ) -> Solver {
-        Solver::new(
-            n, n, n,
-            &terrain_from_blocked(blocked),
-            false, false, false,
-            s.0, s.1, s.2,
-            g.0, g.1, g.2,
-            diagonals, algo,
-        )
-    }
-
-    fn run(mut s: Solver) -> Solver {
-        for _ in 0..1_000_000 {
-            if s.is_done() {
-                break;
-            }
-            s.step_many(1024);
-        }
-        assert!(s.is_done(), "search did not terminate");
-        s
-    }
-
-    fn lcg_terrain(total: usize, seed: u64, obst_pct: u64, weighted: bool) -> Vec<u8> {
-        let mut lcg = seed;
-        let mut next = || {
-            lcg = lcg
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            lcg >> 33
-        };
-        (0..total)
-            .map(|_| {
-                let r = next();
-                if r % 100 < obst_pct {
-                    T_OBST
-                } else if weighted {
-                    1 + (next() % W_MAX as u64) as u8
+    #[test]
+    fn a_fresh_world_has_clean_endpoints_and_a_runnable_search() {
+        for preset in ["cube", "prism", "pyramid", "sphere", "torus"] {
+            let mut w = World::new(preset, 16, 18, 41, false);
+            assert!(w.cell_count() > 0, "{preset}: empty mask");
+            assert_eq!(w.terrain_at(w.start_cell()), 1, "{preset}: start carved");
+            assert_eq!(w.terrain_at(w.goal_cell()), 1, "{preset}: goal carved");
+            for i in 0..w.len() {
+                let t = w.terrain_at(i);
+                let exists = w.dom.exists[i as usize] == 1;
+                if exists {
+                    assert!(t == T_OBST || (1..=W_MAX).contains(&t), "{preset}: byte {t}");
                 } else {
-                    1
+                    assert_eq!(t, T_VOID, "{preset}: mask violated");
                 }
-            })
-            .collect()
+            }
+            let n = w.total_steps();
+            w.seek(n);
+            assert!(w.is_done(), "{preset}: search must terminate");
+        }
     }
 
-    /// Path validity: correct endpoints, every cell existing and unblocked,
-    /// every step a legal (wrap-aware) neighbour move, and the solver's cost
-    /// equal to the re-summed weighted cost.
-    fn assert_valid_path(s: &Solver, path: &[u32]) {
-        assert!(!path.is_empty());
-        assert_eq!(path[0], s.start, "path must start at start");
-        assert_eq!(*path.last().unwrap(), s.goal, "path must end at goal");
-        for &i in path {
-            let t = s.terrain[i as usize];
-            assert!(t != T_VOID && t != T_OBST, "path crosses void/obstacle");
+    #[test]
+    fn torus_wraps_x_and_nothing_else() {
+        let w = World::new("torus", 16, 0, 1, true);
+        assert_eq!(w.wraps(), vec![1u8, 0, 0]);
+    }
+
+    #[test]
+    fn seek_reproduces_the_same_state_as_stepping_there() {
+        let mut a = world();
+        let mut b = world();
+        let target = a.total_steps() / 2;
+        a.advance(target);
+        b.seek(target);
+        assert_eq!(a.expanded(), b.expanded());
+        assert_eq!(a.frontier(), b.frontier());
+        assert_eq!(a.solver.cells(), b.solver.cells());
+    }
+
+    #[test]
+    fn step_back_rewinds_exactly_one_expansion() {
+        let mut w = world();
+        let mid = w.total_steps() / 2;
+        assert!(mid >= 1, "need a search with room to rewind");
+        w.advance(mid);
+        let before = w.solver.cells().to_vec();
+        w.advance(1);
+        assert_eq!(w.expanded(), mid + 1);
+        w.step_back(1);
+        assert_eq!(w.expanded(), mid);
+        assert_eq!(w.solver.cells(), &before[..]);
+    }
+
+    #[test]
+    fn seeking_past_the_end_lands_on_the_finished_search() {
+        let mut w = world();
+        let n = w.total_steps();
+        w.seek(n + 5_000);
+        assert!(w.is_done());
+        assert_eq!(w.expanded(), n);
+    }
+
+    #[test]
+    fn moving_an_endpoint_snaps_off_walls_and_never_onto_the_other_one() {
+        let mut w = world();
+        let goal = w.goal_cell();
+        assert_eq!(w.set_start(goal), w.start_cell() as i32);
+        assert_ne!(w.start_cell(), goal, "the endpoints must stay distinct");
+
+        // Aim the start at a wall: it should land on an open cell nearby.
+        let wall = (0..w.len()).find(|&i| w.terrain_at(i) == T_OBST);
+        if let Some(wall) = wall {
+            let got = w.set_start(wall);
+            assert!(got >= 0);
+            assert_ne!(w.terrain_at(got as u32), T_OBST);
         }
-        for w in path.windows(2) {
-            let (ax, ay, az) = s.coords(w[0]);
-            let (bx, by, bz) = s.coords(w[1]);
-            let dx = s.axis_delta(ax, bx, s.nx, s.wrap[0]);
-            let dy = s.axis_delta(ay, by, s.ny, s.wrap[1]);
-            let dz = s.axis_delta(az, bz, s.nz, s.wrap[2]);
-            assert!(dx <= 1.0 && dy <= 1.0 && dz <= 1.0, "illegal step");
-            let k = dx + dy + dz;
-            assert!(k >= 1.0, "path repeats a cell");
-            if !s.diagonals {
-                assert!(k <= 1.0, "diagonal step while diagonals are off");
-            }
-        }
+    }
+
+    #[test]
+    fn endpoints_cannot_be_walled_in_but_other_cells_can() {
+        let mut w = world();
+        let s = w.start_cell();
+        assert!(!w.paint(s, T_OBST), "the start must not be paintable shut");
+        assert!(!w.paint(w.goal_cell(), T_OBST));
+        let other = (0..w.len())
+            .find(|&i| i != s && w.terrain_at(i) != T_VOID && w.terrain_at(i) != T_OBST)
+            .unwrap();
+        assert!(w.paint(other, T_OBST));
+        assert_eq!(w.terrain_at(other), T_OBST);
+    }
+
+    #[test]
+    fn editing_marks_the_search_stale_rather_than_restarting_it() {
+        let mut w = world();
+        let mid = w.total_steps() / 2;
+        w.advance(mid);
+        let cell = (0..w.len())
+            .find(|&i| i != w.start_cell() && i != w.goal_cell() && w.terrain_at(i) == 1)
+            .unwrap();
+        assert!(w.paint(cell, T_OBST));
+        assert!(w.is_stale(), "an edit must flag the search as stale");
+        assert_eq!(w.expanded(), mid, "but must not restart it mid-stroke");
+        w.reset_search();
+        assert!(!w.is_stale());
+        assert_eq!(w.expanded(), 0);
+    }
+
+    #[test]
+    fn a_hand_drawn_route_is_bridged_scored_and_never_beats_the_optimum() {
+        let mut w = World::new("cube", 12, 12, 7, false);
+        w.route_begin();
+        assert_eq!(w.route_append(w.goal_cell()), ROUTE_OK);
+        assert!(w.route_complete());
+        assert!(w.route_error().is_none(), "{:?}", w.route_error());
+        let cost = w.route_cost();
+        let opt = w.optimal_cost();
+        assert!(cost.is_finite() && opt.is_finite());
         assert!(
-            (s.path_cost(path) - s.cost()).abs() < 1e-9,
-            "cost() must equal the re-summed weighted path cost"
+            cost >= opt - 1e-9,
+            "a drawn route ({cost}) cannot beat the optimum ({opt})"
         );
     }
 
-    fn optimal_cost(
-        dims: (u32, u32, u32),
-        terrain: &[u8],
-        wrap: (bool, bool, bool),
-        s: (u32, u32, u32),
-        g: (u32, u32, u32),
-        diagonals: bool,
-    ) -> Option<f64> {
-        let a = run(Solver::new(
-            dims.0, dims.1, dims.2, terrain, wrap.0, wrap.1, wrap.2,
-            s.0, s.1, s.2, g.0, g.1, g.2, diagonals, ALGO_DIJKSTRA,
-        ));
-        if a.found() { Some(a.cost()) } else { None }
-    }
-
-    // ---------- edition-1 invariants (updated constructor) --------------
-
     #[test]
-    fn empty_3_cube_diagonals_optimal() {
-        let blocked = vec![0u8; 27];
-        let s = run(cube(3, &blocked, (0, 0, 0), (2, 2, 2), true, ALGO_ASTAR));
-        assert!(s.found());
-        let want = 2.0 * SQRT_3;
-        assert!((s.cost() - want).abs() < 1e-9, "cost {} want {}", s.cost(), want);
-        assert_eq!(s.path().len(), 3);
-        assert_eq!(s.path()[0], idx(3, 3, 0, 0, 0));
-        assert_eq!(s.path()[2], idx(3, 3, 2, 2, 2));
+    fn route_undo_removes_a_whole_bridged_leg() {
+        let mut w = World::new("cube", 12, 0, 3, true);
+        w.route_begin();
+        let mid = w.dom.idx(6, 6, 6);
+        assert_eq!(w.route_append(mid), ROUTE_OK);
+        let after_leg = w.route_len();
+        assert!(after_leg > 1);
+        assert_eq!(w.route_append(w.goal_cell()), ROUTE_OK);
+        assert!(w.route_len() > after_leg);
+        w.route_undo();
+        assert_eq!(w.route_len(), after_leg, "undo drops exactly the last leg");
+        w.route_undo();
+        assert_eq!(w.route_len(), 1, "back to just the start cell");
     }
 
     #[test]
-    fn empty_3_cube_no_diagonals_manhattan() {
-        let blocked = vec![0u8; 27];
-        let s = run(cube(3, &blocked, (0, 0, 0), (2, 2, 2), false, ALGO_ASTAR));
-        assert!(s.found());
-        assert!((s.cost() - 6.0).abs() < 1e-9, "cost {} want 6", s.cost());
-        assert_eq!(s.path().len(), 7);
-    }
-
-    #[test]
-    fn threads_through_single_hole_in_blocked_plane() {
-        let n = 5u32;
-        let mut blocked = vec![0u8; 125];
-        for x in 0..n {
-            for y in 0..n {
-                if !(x == 2 && y == 2) {
-                    blocked[idx(n, n, x, y, 2) as usize] = 1;
-                }
-            }
-        }
-        let s = run(cube(n, &blocked, (0, 0, 0), (4, 4, 4), true, ALGO_ASTAR));
-        assert!(s.found());
-        let hole = idx(n, n, 2, 2, 2);
-        assert!(
-            s.path().contains(&hole),
-            "path must pass through the only hole in the z=2 plane"
-        );
-        let want = 4.0 * SQRT_3;
-        assert!((s.cost() - want).abs() < 1e-9, "cost {} want {}", s.cost(), want);
-    }
-
-    #[test]
-    fn walled_off_goal_reports_no_path() {
-        let n = 4u32;
-        let mut blocked = vec![0u8; 64];
-        for x in 2..n {
-            for y in 2..n {
-                for z in 2..n {
-                    if !(x == 3 && y == 3 && z == 3) {
-                        blocked[idx(n, n, x, y, z) as usize] = 1;
-                    }
-                }
-            }
-        }
-        let s = run(cube(n, &blocked, (0, 0, 0), (3, 3, 3), true, ALGO_ASTAR));
-        assert!(s.is_done());
-        assert!(!s.found());
-        assert!(s.path().is_empty());
-    }
-
-    #[test]
-    fn stepped_execution_matches_batch_for_every_algorithm() {
-        let n = 8u32;
-        let terrain = lcg_terrain(512, 42, 25, true);
-        for algo in [
-            ALGO_ASTAR, ALGO_DIJKSTRA, ALGO_GREEDY, ALGO_SWARM,
-            ALGO_CONVERGENT, ALGO_BISWARM, ALGO_BFS, ALGO_DFS,
-        ] {
-            let mk = || Solver::new(
-                n, n, n, &terrain, false, false, false,
-                0, 0, 0, 7, 7, 7, true, algo,
-            );
-            let mut a = mk();
-            let mut b = mk();
-            while !a.is_done() {
-                a.step_many(1);
-            }
-            b.step_many(1_000_000);
-            assert_eq!(a.found(), b.found(), "algo {algo}: found mismatch");
-            assert_eq!(a.expanded(), b.expanded(), "algo {algo}: expanded mismatch");
-            if a.found() {
-                assert!((a.cost() - b.cost()).abs() < 1e-9, "algo {algo}: cost mismatch");
-                assert_eq!(a.path(), b.path(), "algo {algo}: path mismatch");
-            }
+    fn a_route_into_a_wall_is_refused() {
+        let mut w = world();
+        let wall = (0..w.len()).find(|&i| w.terrain_at(i) == T_OBST);
+        if let Some(wall) = wall {
+            w.route_begin();
+            assert_eq!(w.route_append(wall), ROUTE_BLOCKED);
         }
     }
 
     #[test]
-    fn path_steps_are_valid_neighbour_moves() {
-        let n = 7u32;
-        let mut blocked = vec![0u8; 343];
-        for x in 0..n {
-            for y in 0..n {
-                if !(x == 1 && y == 5) {
-                    blocked[idx(n, n, x, y, 3) as usize] = 1;
-                }
-            }
+    fn changing_the_algorithm_restarts_the_search_but_keeps_the_world() {
+        let mut w = world();
+        let before: Vec<u8> = (0..w.len()).map(|i| w.terrain_at(i)).collect();
+        w.advance(120);
+        w.set_algo(solver::ALGO_DFS);
+        assert_eq!(w.expanded(), 0);
+        assert_eq!(w.algo(), solver::ALGO_DFS);
+        let after: Vec<u8> = (0..w.len()).map(|i| w.terrain_at(i)).collect();
+        assert_eq!(before, after, "the terrain must survive an algorithm change");
+    }
+
+    #[test]
+    fn clearing_terrain_leaves_open_ground_and_a_solvable_world() {
+        let mut w = world();
+        w.clear_terrain();
+        for i in 0..w.len() {
+            let t = w.terrain_at(i);
+            assert!(t == T_VOID || t == 1, "cell {i} left at {t}");
         }
-        let s = run(cube(n, &blocked, (0, 0, 0), (6, 6, 6), true, ALGO_ASTAR));
-        assert!(s.found());
-        assert_valid_path(&s, &s.path());
-    }
-
-    // ---------- edition-2: weighted cells --------------------------------
-
-    #[test]
-    fn dijkstra_equals_astar_on_weighted_random_grids() {
-        let n = 8u32;
-        for seed in [7u64, 99, 1234, 555, 2026] {
-            let terrain = lcg_terrain(512, seed, 20, true);
-            let a = run(Solver::new(
-                n, n, n, &terrain, false, false, false,
-                0, 0, 0, 7, 7, 7, true, ALGO_ASTAR,
-            ));
-            let d = run(Solver::new(
-                n, n, n, &terrain, false, false, false,
-                0, 0, 0, 7, 7, 7, true, ALGO_DIJKSTRA,
-            ));
-            assert_eq!(a.found(), d.found(), "seed {seed}: found mismatch");
-            if a.found() {
-                assert!(
-                    (a.cost() - d.cost()).abs() < 1e-9,
-                    "seed {seed}: A* {} != Dijkstra {}",
-                    a.cost(),
-                    d.cost()
-                );
-                assert_valid_path(&a, &a.path());
-                assert_valid_path(&d, &d.path());
-            }
-        }
+        let n = w.total_steps();
+        w.seek(n);
+        assert!(w.is_done() && w.found());
     }
 
     #[test]
-    fn heavy_cell_forces_detour_light_cell_does_not() {
-        // 5x3x3 corridor, start (0,1,1) -> goal (4,1,1), no diagonals.
-        // The straight line passes through (2,1,1); a detour via y=0 costs 6.
-        // Straight-through cost is 3 + W (entering 4 cells, one of weight W).
-        let (nx, ny, nz) = (5u32, 3u32, 3u32);
-        let total = (nx * ny * nz) as usize;
-        let mid = idx(nx, ny, 2, 1, 1);
-        for (w, want, through) in [(10u8, 6.0, false), (2u8, 5.0, true)] {
-            let mut terrain = vec![1u8; total];
-            terrain[mid as usize] = w;
-            let s = run(Solver::new(
-                nx, ny, nz, &terrain, false, false, false,
-                0, 1, 1, 4, 1, 1, false, ALGO_ASTAR,
-            ));
-            assert!(s.found());
-            assert!(
-                (s.cost() - want).abs() < 1e-9,
-                "weight {w}: cost {} want {want}",
-                s.cost()
-            );
-            assert_eq!(
-                s.path().contains(&mid),
-                through,
-                "weight {w}: through-mid should be {through}"
-            );
-            assert_valid_path(&s, &s.path());
-            // Dijkstra agrees.
-            let d = run(Solver::new(
-                nx, ny, nz, &terrain, false, false, false,
-                0, 1, 1, 4, 1, 1, false, ALGO_DIJKSTRA,
-            ));
-            assert!((d.cost() - want).abs() < 1e-9);
-        }
-    }
-
-    // ---------- edition-2: BFS/DFS hop semantics --------------------------
-
-    #[test]
-    fn bfs_returns_fewest_hops_not_least_cost() {
-        // 3x3x1, diagonals on, heavy centre. BFS takes the 2-hop diagonal
-        // route through the centre; A* pays fewer coins on a 3-hop detour.
-        let (nx, ny, nz) = (3u32, 3u32, 1u32);
-        let mut terrain = vec![1u8; 9];
-        terrain[idx(nx, ny, 1, 1, 0) as usize] = 10;
-        let bfs = run(Solver::new(
-            nx, ny, nz, &terrain, false, false, false,
-            0, 0, 0, 2, 2, 0, true, ALGO_BFS,
-        ));
-        assert!(bfs.found());
-        assert_eq!(bfs.path().len(), 3, "fewest hops is 2 (3 cells)");
-        assert_valid_path(&bfs, &bfs.path());
-        let astar = run(Solver::new(
-            nx, ny, nz, &terrain, false, false, false,
-            0, 0, 0, 2, 2, 0, true, ALGO_ASTAR,
-        ));
-        assert!(astar.found());
-        assert!(astar.path().len() > bfs.path().len(), "A* takes more hops here");
-        assert!(astar.cost() < bfs.cost(), "least cost beats fewest hops here");
-    }
-
-    #[test]
-    fn bfs_fewest_hops_hand_checked() {
-        // Empty 4^3, corner to corner, diagonals on: 3 hops (4 cells).
-        let blocked = vec![0u8; 64];
-        let s = run(cube(4, &blocked, (0, 0, 0), (3, 3, 3), true, ALGO_BFS));
-        assert!(s.found());
-        assert_eq!(s.path().len(), 4);
-        // Diagonals off: Manhattan distance 9 hops (10 cells).
-        let s = run(cube(4, &blocked, (0, 0, 0), (3, 3, 3), false, ALGO_BFS));
-        assert!(s.found());
-        assert_eq!(s.path().len(), 10);
-    }
-
-    // ---------- edition-2: non-optimal algorithms stay honest -------------
-
-    #[test]
-    fn suboptimal_algorithms_return_valid_paths_never_beating_optimal() {
-        let n = 8u32;
-        for seed in [3u64, 77, 909] {
-            for diagonals in [true, false] {
-                let terrain = lcg_terrain(512, seed, 18, true);
-                let opt = optimal_cost(
-                    (n, n, n), &terrain, (false, false, false),
-                    (0, 0, 0), (7, 7, 7), diagonals,
-                );
-                for algo in [
-                    ALGO_GREEDY, ALGO_SWARM, ALGO_CONVERGENT,
-                    ALGO_BISWARM, ALGO_BFS, ALGO_DFS,
-                ] {
-                    let s = run(Solver::new(
-                        n, n, n, &terrain, false, false, false,
-                        0, 0, 0, 7, 7, 7, diagonals, algo,
-                    ));
-                    assert_eq!(
-                        s.found(),
-                        opt.is_some(),
-                        "seed {seed} algo {algo}: reachability must match Dijkstra"
-                    );
-                    if let Some(opt) = opt {
-                        assert_valid_path(&s, &s.path());
-                        assert!(
-                            s.cost() >= opt - 1e-9,
-                            "seed {seed} algo {algo}: cost {} beats optimal {opt}",
-                            s.cost()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn bidirectional_returns_valid_connected_path() {
-        let n = 10u32;
-        let terrain = lcg_terrain(1000, 4242, 22, true);
-        let s = run(Solver::new(
-            n, n, n, &terrain, false, false, false,
-            0, 0, 0, 9, 9, 9, true, ALGO_BISWARM,
-        ));
-        assert!(s.found(), "grid should be solvable");
-        assert_valid_path(&s, &s.path());
-    }
-
-    // ---------- edition-2: wraparound -------------------------------------
-
-    #[test]
-    fn wrap_x_shortcut_beats_unwrapped_route() {
-        // 9x3x3 corridor, endpoints on opposite x faces. Without wrap the
-        // best route costs 8; with wrap_x it is a single step.
-        let (nx, ny, nz) = (9u32, 3u32, 3u32);
-        let terrain = vec![1u8; (nx * ny * nz) as usize];
-        let flat = run(Solver::new(
-            nx, ny, nz, &terrain, false, false, false,
-            0, 1, 1, 8, 1, 1, false, ALGO_ASTAR,
-        ));
-        let wrapped = run(Solver::new(
-            nx, ny, nz, &terrain, true, false, false,
-            0, 1, 1, 8, 1, 1, false, ALGO_ASTAR,
-        ));
-        assert!((flat.cost() - 8.0).abs() < 1e-9);
-        assert!((wrapped.cost() - 1.0).abs() < 1e-9);
-        assert!(wrapped.cost() < flat.cost());
-        assert_valid_path(&wrapped, &wrapped.path());
-    }
-
-    #[test]
-    fn astar_stays_optimal_with_wrap_on_weighted_grids() {
-        // The wrap-aware heuristic must keep A* == Dijkstra.
-        let (nx, ny, nz) = (9u32, 7u32, 8u32);
-        let total = (nx * ny * nz) as usize;
-        for seed in [11u64, 313, 9000] {
-            let terrain = lcg_terrain(total, seed, 20, true);
-            let a = run(Solver::new(
-                nx, ny, nz, &terrain, true, true, true,
-                0, 0, 0, 8, 6, 7, true, ALGO_ASTAR,
-            ));
-            let d = run(Solver::new(
-                nx, ny, nz, &terrain, true, true, true,
-                0, 0, 0, 8, 6, 7, true, ALGO_DIJKSTRA,
-            ));
-            assert_eq!(a.found(), d.found());
-            if a.found() {
-                assert!(
-                    (a.cost() - d.cost()).abs() < 1e-9,
-                    "seed {seed}: wrapped A* {} != Dijkstra {}",
-                    a.cost(),
-                    d.cost()
-                );
-                assert_valid_path(&a, &a.path());
-            }
-        }
-    }
-
-    // ---------- edition-2: domain mask -------------------------------------
-
-    #[test]
-    fn void_cells_never_searched_and_masked_goal_is_unreachable() {
-        // Ellipsoid mask inside a 9^3 box; everything outside is void.
-        let n = 9u32;
-        let total = (n * n * n) as usize;
-        let c = 4.0;
-        let inside = |x: u32, y: u32, z: u32| {
-            let (dx, dy, dz) = (x as f64 - c, y as f64 - c, z as f64 - c);
-            (dx * dx + dy * dy + dz * dz).sqrt() <= 4.2
-        };
-        let mut terrain = vec![T_VOID; total];
-        for z in 0..n {
-            for y in 0..n {
-                for x in 0..n {
-                    if inside(x, y, z) {
-                        terrain[idx(n, n, x, y, z) as usize] = 1 + ((x + y + z) % 3) as u8;
-                    }
-                }
-            }
-        }
-        assert!(inside(4, 4, 0) && inside(4, 4, 8), "endpoints must exist");
-        for algo in [ALGO_ASTAR, ALGO_BFS, ALGO_DFS, ALGO_BISWARM] {
-            let s = run(Solver::new(
-                n, n, n, &terrain, false, false, false,
-                4, 4, 0, 4, 4, 8, true, algo,
-            ));
-            assert!(s.found(), "algo {algo}: path must exist inside the mask");
-            let state = s.state();
-            for i in 0..total {
-                if terrain[i] == T_VOID {
-                    assert_eq!(
-                        state[i], FREE,
-                        "algo {algo}: void cell {i} entered the search"
-                    );
-                    assert!(!s.path().contains(&(i as u32)));
-                }
-            }
-            assert_valid_path(&s, &s.path());
-        }
-        // A goal placed outside the mask reports no path immediately.
-        assert!(!inside(0, 0, 0));
-        let s = run(Solver::new(
-            n, n, n, &terrain, false, false, false,
-            4, 4, 0, 0, 0, 0, true, ALGO_ASTAR,
-        ));
-        assert!(s.is_done());
-        assert!(!s.found());
-        assert!(s.path().is_empty());
-    }
-
-    // ---------- misc edge cases --------------------------------------------
-
-    #[test]
-    fn start_equals_goal_is_a_zero_cost_path() {
-        let terrain = vec![1u8; 27];
-        let s = Solver::new(
-            3, 3, 3, &terrain, false, false, false,
-            1, 1, 1, 1, 1, 1, true, ALGO_ASTAR,
-        );
-        assert!(s.is_done() && s.found());
-        assert_eq!(s.path(), vec![idx(3, 3, 1, 1, 1)]);
-        assert!(s.cost().abs() < 1e-12);
-    }
-
-    #[test]
-    fn non_cubic_dims_route_correctly() {
-        let (nx, ny, nz) = (6u32, 3u32, 4u32);
-        let terrain = vec![1u8; (nx * ny * nz) as usize];
-        let s = run(Solver::new(
-            nx, ny, nz, &terrain, false, false, false,
-            0, 0, 0, 5, 2, 3, true, ALGO_ASTAR,
-        ));
-        assert!(s.found());
-        // deltas (5,2,3) sorted desc: (5-3)*1 + (3-2)*sqrt2 + 2*sqrt3
-        let want = 2.0 + SQRT_2 + 2.0 * SQRT_3;
-        assert!((s.cost() - want).abs() < 1e-9, "cost {} want {}", s.cost(), want);
-        assert_valid_path(&s, &s.path());
+    fn picking_resolves_a_cell_from_a_camera_ray() {
+        let w = World::new("cube", 10, 0, 1, true);
+        let target = w.dom.idx(5, 5, 5);
+        let p = w.dom.world_of(target);
+        // Nothing solid in an empty world, so this resolves through the plane
+        // fallback; aim along -z with the anchor at the domain centre.
+        let got = w.pick_build(p[0], p[1], p[2] + 25.0, 0.0, 0.0, -1.0);
+        assert!(got >= 0, "an empty world must still be clickable");
     }
 }
